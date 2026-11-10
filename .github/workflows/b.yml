@@ -1,0 +1,22 @@
+name: B
+on:
+  schedule:
+    - cron: '*/25 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '保活动作'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, start, authorize, ssh]
+concurrency:
+  group: cb
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
