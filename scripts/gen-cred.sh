@@ -1,124 +1,123 @@
 #!/usr/bin/env bash
-# gen-cred.sh — 在 Cloud Shell 里生成 CI 用的 gcloud 凭证 JSON
+# gen-cred.sh — 生成 CI 用的 gcloud 凭证（严格版，已按实测坑位修正）
 #
-# 为什么需要这一步:
-#   users/me/environments 是「用户级」API，service account 调不了。
-#   所以 CI 必须用你本人的凭证。gcloud 凭证的 refresh token 可以长期复用，
-#   放进 GitHub Secrets 后 CI 就能以你的身份调用 Cloud Shell API。
+# 关键约束（实测确认）:
+#   * users/me/environments 是「用户级」API，service account 调不了 → 必须用你本人凭证
+#   * Cloud Shell 容器内的 gcloud 凭证是临时的（credentials.db 0 行），不能拿来复用到 CI
+#   * gcloud auth login --cred-file 只接受 service_account / external_account，
+#     不接受 authorized_user → authorized_user 必须走 activate-refresh-token
 #
 # 用法:
-#   bash gen-cred.sh                 # 生成并打印（会写入 ~/.gcp_cred_ci.json）
-#   bash gen-cred.sh --show          # 只显示已生成的凭证
-#   bash gen-cred.sh --revoke        # 用完后撤销（可选，安全卫生）
+#   bash gen-cred.sh          生成并校验
+#   bash gen-cred.sh --show   显示已生成内容
+#   bash gen-cred.sh --revoke 撤销并删除
 #
-# 安全提示:
-#   该 JSON 等价于你账号的长期访问权。只贴进目标仓库的 Secrets，
-#   不要提交、不要贴到聊天窗口。用完可 revoke。
+# 该 JSON 等价于你账号的长期访问权：只放进私有仓库 Secrets。
 
 set -uo pipefail
-
 OUT="$HOME/.gcp_cred_ci.json"
 SCOPE="https://www.googleapis.com/auth/cloud-platform"
 
 case "${1:-}" in
   --show)
-    [[ -f "$OUT" ]] && cat "$OUT" || echo "还没生成，先跑 bash gen-cred.sh"
-    exit 0
-    ;;
+    [[ -f "$OUT" ]] && cat "$OUT" || echo "还没生成，先跑 bash gen-cred.sh"; exit 0 ;;
   --revoke)
     if [[ -f "$OUT" ]]; then
       rt=$(python3 -c "import json;print(json.load(open('$OUT')).get('refresh_token',''))" 2>/dev/null)
-      if [[ -n "$rt" ]]; then
-        curl -s -X POST https://oauth2.googleapis.com/revoke -d "token=$rt" >/dev/null \
-          && echo "refresh token 已撤销" || echo "撤销失败（可能已失效）"
-        shred -u "$OUT" 2>/dev/null || rm -f "$OUT"
-      fi
+      [[ -n "$rt" ]] && curl -s -X POST https://oauth2.googleapis.com/revoke -d "token=$rt" >/dev/null \
+        && echo "refresh token 已撤销"
+      shred -u "$OUT" 2>/dev/null || rm -f "$OUT"
+      echo "本地凭证已删除"
     fi
-    exit 0
-    ;;
+    exit 0 ;;
 esac
 
-echo "=== 1. 检查 gcloud 登录状态 ==="
-if ! gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | grep -q .; then
-  echo "当前 Cloud Shell 内没有 gcloud 凭证。"
-  echo "请先在本机（或任意有浏览器的机器）登录，再用 --cred-file 导出："
+echo "=== 1. 检查能否在本机直接生成 ==="
+ADC="$HOME/.config/gcloud/application_default_credentials.json"
+
+if [[ -f "$ADC" ]] && python3 -c "
+import json,sys
+b=json.load(open('$ADC'))
+sys.exit(0 if b.get('refresh_token') else 1)" 2>/dev/null; then
+  cp "$ADC" "$OUT"; chmod 600 "$OUT"
+  echo "已复制现有 ADC → $OUT"
+else
+  echo "本机没有可用的 ADC 文件。"
   echo
-  echo "  gcloud auth login --update-adc"
-  echo "  # 导出可复用的凭证文件："
-  echo "  gcloud auth application-default login --scopes=$SCOPE"
-  echo "  cat ~/.config/gcloud/application_default_credentials.json"
+  echo "本机 gcloud 状态:"
+  gcloud auth list --format='value(account)' 2>/dev/null | sed 's/^/  /' || echo "  (无)"
   echo
-  echo "把该 JSON 整体作为 GCP_CRED_JSON 存进 GitHub Secrets 即可。"
+  if gcloud auth list --format='value(account)' 2>/dev/null | grep -q .; then
+    ACCOUNT=$(gcloud auth list --format='value(account)' 2>/dev/null | head -1)
+    echo "检测到账号 $ACCOUNT，尝试用 refresh token 组装..."
+    RT=$(gcloud auth print-refresh-token "$ACCOUNT" 2>/dev/null || true)
+    if [[ -n "$RT" ]]; then
+      python3 - "$ACCOUNT" "$RT" "$OUT" <<'PY'
+import json,sys
+acct,rt,out=sys.argv[1],sys.argv[2],sys.argv[3]
+json.dump({"type":"authorized_user",
+  "client_id":"32555940559.apps.googleusercontent.com",
+  "client_secret":"ZmssLNjJy2998hD4CTg2ejr2",
+  "refresh_token":rt,"account":acct}, open(out,"w"), indent=2)
+print("已写入",out)
+PY
+      chmod 600 "$OUT"
+    fi
+  fi
+fi
+
+if [[ ! -f "$OUT" ]]; then
+  cat <<EOF
+
+────────────────────────────────────────────
+需要在【有浏览器的机器】上导出凭证（不是 Cloud Shell）：
+
+  gcloud auth application-default login \\
+    --scopes=$SCOPE
+
+  cat ~/.config/gcloud/application_default_credentials.json
+
+把输出的整段 JSON 作为 GitHub Secret GCP_CRED_JSON 填入。
+────────────────────────────────────────────
+EOF
   exit 1
 fi
 
-ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -1)
-echo "当前账号: $ACCOUNT"
-
 echo
-echo "=== 2. 尝试直接导出 ADC 文件 ==="
-ADC="$HOME/.config/gcloud/application_default_credentials.json"
-if [[ -f "$ADC" ]]; then
-  cp "$ADC" "$OUT" && chmod 600 "$OUT"
-  echo "已复制现有 ADC → $OUT"
-else
-  echo "本机无 ADC，尝试用 refresh token 组装..."
-  RT=$(gcloud auth print-refresh-token "$ACCOUNT" 2>/dev/null || true)
-  if [[ -z "$RT" ]]; then
-    echo "取不到 refresh token（Cloud Shell 里的凭证通常是临时的）。"
-    echo "请按上面第 1 步在有浏览器的机器上导出 ADC JSON。"
-    exit 1
-  fi
-  python3 - "$ACCOUNT" "$RT" "$OUT" <<'PY'
-import json, sys
-acct, rt, out = sys.argv[1], sys.argv[2], sys.argv[3]
-blob = {
-    "type": "authorized_user",
-    "client_id": "32555940559.apps.googleusercontent.com",
-    "client_secret": "ZmssLNjJy2998hD4CTg2ejr2",
-    "refresh_token": rt,
-    "account": acct,
-}
-open(out, "w").write(json.dumps(blob, indent=2))
-print("已写入", out)
-PY
-  chmod 600 "$OUT" 2>/dev/null
-fi
-
-[[ -f "$OUT" ]] || { echo "生成失败"; exit 1; }
-
-echo
-echo "=== 3. 验证凭证可用 ==="
+echo "=== 2. 校验凭证有效性 ==="
 python3 - "$OUT" <<'PY'
-import json, sys, urllib.request, urllib.parse
-b = json.load(open(sys.argv[1]))
-data = urllib.parse.urlencode({
-    "client_id": b["client_id"],
-    "client_secret": b["client_secret"],
-    "refresh_token": b["refresh_token"],
-    "grant_type": "refresh_token",
-}).encode()
+import json,sys,urllib.request,urllib.parse
+b=json.load(open(sys.argv[1]))
+print("  type:", b.get("type"))
+if not b.get("refresh_token"):
+    print("  ✗ 缺 refresh_token"); sys.exit(1)
+data=urllib.parse.urlencode({
+    "client_id":b.get("client_id",""),
+    "client_secret":b.get("client_secret",""),
+    "refresh_token":b["refresh_token"],
+    "grant_type":"refresh_token"}).encode()
 try:
-    r = urllib.request.urlopen("https://oauth2.googleapis.com/token", data=data, timeout=20)
-    tok = json.load(r)
-    print("✓ 凭证有效，access_token 长度", len(tok.get("access_token", "")))
-    print("  scope:", tok.get("scope", "")[:160])
+    r=urllib.request.urlopen("https://oauth2.googleapis.com/token",data=data,timeout=20)
+    t=json.load(r)
+    print("  ✓ 有效，access_token 长度", len(t.get("access_token","")))
+    print("  scope:", (t.get("scope") or "")[:120])
 except Exception as e:
-    print("✗ 凭证无效:", e)
-    sys.exit(1)
+    print("  ✗ 无效:", e); sys.exit(1)
 PY
+rc=$?
+[[ $rc -ne 0 ]] && exit 1
 
 echo
-echo "=== 4. 下一步 ==="
+echo "=== 3. 填入 GitHub Secrets（复制即用）==="
 cat <<EOF
-1) 复制下面内容，存为 GitHub 仓库 Secrets → GCP_CRED_JSON：
+gh secret set GCP_CRED_JSON --repo lws666/cloudshell-keepalive < $OUT
+gh secret set GCP_PROJECT   --repo lws666/cloudshell-keepalive --body "你的项目ID"
 
-$(cat "$OUT")
+# 可选：Telegram 通知
+gh secret set TG_BOT_TOKEN --repo lws666/cloudshell-keepalive --body "123:AAH..."
+gh secret set TG_CHAT_ID   --repo lws666/cloudshell-keepalive --body "123456789"
 
-2) 同名建议同时加：
-   GCP_PROJECT     = 你的项目 ID
-   TG_BOT_TOKEN    = (可选) Telegram 通知
-   TG_CHAT_ID      = (可选)
-
-3) 把 .github/workflows/keepalive.yml 放进仓库，启用 Actions。
+# 填完手动跑一次
+gh workflow run keepalive.yml --repo lws666/cloudshell-keepalive
+gh run watch --repo lws666/cloudshell-keepalive
 EOF
