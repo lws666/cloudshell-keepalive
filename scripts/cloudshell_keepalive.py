@@ -88,53 +88,76 @@ def sh(cmd, timeout=300, check=False, capture=True):
 # ─────────────────── 认证 ───────────────────
 
 def setup_auth():
-    """把 GCP_CRED_JSON 写盘并用 gcloud 激活。"""
-    cred_json = os.environ.get("GCP_CRED_JSON", "").strip()
-    if not cred_json:
-        log("未提供 GCP_CRED_JSON，尝试使用 CI 环境已有凭证")
-        # gcloud auth list 没有 status 字段（--filter=status:ACTIVE 会告警），
-        # 直接用 json 判断有没有账号；有 ACTIVE 标记才算数。
-        rc, out, _ = sh(["gcloud", "auth", "list", "--format=json"])
-        if rc != 0 or not out:
-            return False
+    """
+    认证顺序（针对 CI 环境的真实约束）:
+      1. service account key      —— gcloud auth activate-service-account
+      2. authorized_user (ADC)    —— 用 refresh_token 走 activate-refresh-token
+                                     （注意: gcloud auth login --cred-file 只接受
+                                       service account / external account，
+                                       不接受 authorized_user，别用那个）
+      3. external account         —— workload identity pool 配置
+    环境里已有 ACTIVE 账号时直接复用，避免无谓重登。
+    """
+    # 复用已有凭证
+    rc, out, _ = sh(["gcloud", "auth", "list", "--format=json"])
+    if rc == 0 and out:
         try:
             accounts = json.loads(out)
+            if any(a.get("status") == "ACTIVE" for a in accounts if isinstance(a, dict)):
+                log("CI 环境已有 ACTIVE 账号，直接复用")
+                return True
         except Exception:
-            return False
-        return any(a.get("status") == "ACTIVE" for a in accounts if isinstance(a, dict))
+            pass
+
+    cred_json = os.environ.get("GCP_CRED_JSON", "").strip()
+    if not cred_json:
+        log("未提供 GCP_CRED_JSON，且无已有凭证")
+        return False
 
     path = os.path.expanduser("~/.gcp_cred.json")
     with open(path, "w") as f:
         f.write(cred_json)
     os.chmod(path, 0o600)
 
-    # 先在真实 HOME 配置里激活，避免 CI 上 CLOUDSDK_CONFIG 干扰
+    # CI 上 setup-gcloud 会设 CLOUDSDK_CONFIG，清掉以保证写到默认配置
     os.environ.pop("CLOUDSDK_CONFIG", None)
-    rc, _, _ = sh(["gcloud", "auth", "activate-service-account", "--key-file", path])
-    if rc == 0:
-        log("以 service account 激活成功")
-        return True
 
-    # 用户凭证（refresh token 格式）
-    rc, _, _ = sh(["gcloud", "auth", "login", "--cred-file", path, "--brief", "--quiet"])
-    if rc == 0:
-        log("以用户凭证（cred-file）激活成功")
-        return True
-
-    # 退化：直接当 refresh token 用
     try:
         blob = json.loads(cred_json)
-        rt = blob.get("refresh_token") or blob.get("installed", {}).get("refresh_token")
-        acct = blob.get("client_email") or blob.get("account") or "keepalive@ci"
+    except Exception as e:
+        log(f"凭证 JSON 解析失败: {e}")
+        return False
+
+    ctype = (blob.get("type") or "").strip()
+    log(f"凭证类型: {ctype or '(未标 type)'}")
+
+    # ── 1. service account ──
+    if ctype == "service_account" or "private_key" in blob:
+        rc, _, _ = sh(["gcloud", "auth", "activate-service-account", "--key-file", path])
+        if rc == 0:
+            log("service account 激活成功")
+            return True
+        log("service account 激活失败")
+
+    # ── 2. authorized_user（ADC / refresh token）──
+    if ctype == "authorized_user" or blob.get("refresh_token"):
+        rt = blob.get("refresh_token", "")
+        acct = blob.get("account") or blob.get("client_email") or "keepalive@ci.local"
         if rt:
             rc, _, _ = sh(["gcloud", "auth", "activate-refresh-token", acct, rt])
             if rc == 0:
-                log("以 refresh token 激活成功")
+                log(f"refresh token 激活成功 ({acct})")
                 return True
-    except Exception as e:
-        log(f"解析凭证失败: {e}")
+            log("refresh token 激活失败（可能已过期或被撤销）")
 
-    log("认证失败")
+    # ── 3. external account（workload identity pool）──
+    if ctype == "external_account":
+        rc, _, _ = sh(["gcloud", "auth", "login", "--cred-file", path, "--brief", "--quiet"])
+        if rc == 0:
+            log("external account 激活成功")
+            return True
+
+    log("所有认证方式均失败")
     return False
 
 
