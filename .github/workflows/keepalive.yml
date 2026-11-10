@@ -58,11 +58,27 @@ jobs:
           echo "credential bytes: $(stat -c%s "$HOME/.gcp_cred.json")"
 
       - name: Activate credential
+        env:
+          GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
         run: |
           set -euo pipefail
           unset CLOUDSDK_CONFIG || true
-          gcloud auth activate-service-account --key-file "$HOME/.gcp_cred.json" 2>/dev/null \
-            || gcloud auth login --cred-file "$HOME/.gcp_cred.json" --brief --quiet
+          TYPE=$(python3 -c "import json,os;print(json.loads(os.environ['GCP_CRED_JSON']).get('type',''))")
+          echo "credential type: $TYPE"
+          case "$TYPE" in
+            service_account)
+              gcloud auth activate-service-account --key-file "$HOME/.gcp_cred.json" ;;
+            authorized_user)
+              # --cred-file 不接受 authorized_user，必须走 activate-refresh-token
+              ACCT=$(python3 -c "import json,os;b=json.loads(os.environ['GCP_CRED_JSON']);print(b.get('account') or b.get('client_email') or 'ci@local')")
+              RT=$(python3 -c "import json,os;print(json.loads(os.environ['GCP_CRED_JSON'])['refresh_token'])")
+              gcloud auth activate-refresh-token "$ACCT" "$RT" ;;
+            external_account)
+              gcloud auth login --cred-file "$HOME/.gcp_cred.json" --brief --quiet ;;
+            *)
+              echo "::error::unsupported credential type: $TYPE"
+              exit 1 ;;
+          esac
           gcloud auth list --format='value(account)'
 
       - name: Set project
