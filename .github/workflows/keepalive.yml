@@ -1,23 +1,23 @@
 name: Cloud Shell 自动保活
 
-# 对照 ClawCloud-Run 的 auto_login.yml:
-#   ClawCloud 靠 Playwright 登录网页；Cloud Shell 有官方 API，
-#   所以这里用 users.environments.start / authorize + cloud-shell ssh。
+# 对照 ClawCloud-Run 的 auto_login.yml：
+#   ClawCloud 靠 Playwright 登录网页；Cloud Shell 有官方 REST API，
+#   所以用 users.environments.start / authorize + cloud-shell ssh 完成保活。
 #
-# 调度策略（关键）:
-#   Cloud Shell 的空闲线是 40 分钟（非交互）/ 约 1 小时（交互），
-#   会话硬上限 12 小时。每 25 分钟敲一次，卡在空闲线以内。
-#   配合远端 ka.sh（5h 自退），形成双层保活。
+# 调度：每 25 分钟一次，压住 Cloud Shell 的 40 分钟非交互空闲线。
+# 远端另有 ka.sh（5 小时自退）负责进程级保活，两层互补。
+#
+# 注意：schedule 与 workflow_dispatch 之间不要插入注释，
+#       GitHub Actions 的 workflow 解析器对列表内的注释敏感，会导致整个
+#       workflow 不被注册（actions/workflows 返回 0 条，workflow run 报 404）。
 
 on:
   schedule:
-    # 每 25 分钟一次。GitHub 免费额度下 cron 常有 5-15 分钟漂移，
-    # 25 分钟仍能稳稳压在 40 分钟空闲线内。
     - cron: '*/25 * * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: '保活动作'
+        description: 'keepalive action: all / start / authorize / ssh'
         required: false
         default: 'all'
         type: choice
@@ -36,63 +36,61 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: 检出仓库
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 安装 gcloud CLI
+      - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           version: 'latest'
 
-      - name: 写入 gcloud 凭证
+      - name: Write credential
         env:
           GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
         run: |
           set -euo pipefail
           if [ -z "${GCP_CRED_JSON:-}" ]; then
-            echo "::error::缺少 secret GCP_CRED_JSON"
+            echo "::error::missing secret GCP_CRED_JSON"
             exit 1
           fi
           umask 077
           printf '%s' "$GCP_CRED_JSON" > "$HOME/.gcp_cred.json"
-          echo "凭证已写入 $(stat -c%s "$HOME/.gcp_cred.json") 字节"
+          echo "credential bytes: $(stat -c%s "$HOME/.gcp_cred.json")"
 
-      - name: 激活凭证
-        env:
-          GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
+      - name: Activate credential
         run: |
           set -euo pipefail
           unset CLOUDSDK_CONFIG || true
           gcloud auth activate-service-account --key-file "$HOME/.gcp_cred.json" 2>/dev/null \
             || gcloud auth login --cred-file "$HOME/.gcp_cred.json" --brief --quiet
-          echo "--- 当前身份 ---"
-          gcloud auth list --format='value(account,status)'
+          gcloud auth list --format='value(account)'
 
-      - name: 设置项目
+      - name: Set project
         env:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
         run: |
           if [ -n "${GCP_PROJECT:-}" ]; then
             gcloud config set project "$GCP_PROJECT"
-            echo "项目: $GCP_PROJECT"
+            echo "project: $GCP_PROJECT"
           else
-            echo "未设 GCP_PROJECT，使用默认项目"
+            echo "no GCP_PROJECT secret, using default"
           fi
 
-      - name: 执行保活
+      - name: Run keepalive
         env:
           GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           KEEPALIVE_MODE: ${{ github.event.inputs.mode || 'all' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          python3 scripts/cloudshell_keepalive.py
+        run: python3 scripts/cloudshell_keepalive.py
 
-      - name: 汇总
+      - name: Summary
         if: always()
         run: |
-          echo "### Cloud Shell 保活结果" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 模式: ${{ github.event.inputs.mode || 'all' }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 触发: ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Cloud Shell keepalive"
+            echo "- mode: ${{ github.event.inputs.mode || 'all' }}"
+            echo "- trigger: ${{ github.event_name }}"
+            echo "- time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } >> "$GITHUB_STEP_SUMMARY"
