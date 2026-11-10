@@ -1,0 +1,88 @@
+name: Cloud Shell 自动保活
+
+
+on:
+  schedule:
+    - cron: '*/25 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '保活动作'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, start, authorize, ssh]
+
+concurrency:
+  group: cloudshell-keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          version: 'latest'
+
+      - name: 写入 gcloud 凭证
+        env:
+          GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GCP_CRED_JSON:-}" ]; then
+            echo "::error::缺少 secret GCP_CRED_JSON"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$GCP_CRED_JSON" > "$HOME/.gcp_cred.json"
+          echo "凭证已写入 $(stat -c%s "$HOME/.gcp_cred.json") 字节"
+
+      - name: 激活凭证
+        env:
+          GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
+        run: |
+          set -euo pipefail
+          unset CLOUDSDK_CONFIG || true
+          gcloud auth activate-service-account --key-file "$HOME/.gcp_cred.json" 2>/dev/null \
+            || gcloud auth login --cred-file "$HOME/.gcp_cred.json" --brief --quiet
+          echo "--- 当前身份 ---"
+          gcloud auth list --format='value(account,status)'
+
+      - name: 设置项目
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: |
+          if [ -n "${GCP_PROJECT:-}" ]; then
+            gcloud config set project "$GCP_PROJECT"
+            echo "项目: $GCP_PROJECT"
+          else
+            echo "未设 GCP_PROJECT，使用默认项目"
+          fi
+
+      - name: 执行保活
+        env:
+          GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          KEEPALIVE_MODE: ${{ github.event.inputs.mode || 'all' }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python3 scripts/cloudshell_keepalive.py
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "### Cloud Shell 保活结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 模式: ${{ github.event.inputs.mode || 'all' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 触发: ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_STEP_SUMMARY"
