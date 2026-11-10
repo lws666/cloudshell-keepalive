@@ -30,7 +30,7 @@ POST https://cloudshell.googleapis.com/v1/users/me/environments/default:start
 
 ### 1. 生成凭证
 
-**在有浏览器的机器上**（不是 Cloud Shell 里，Cloud Shell 的凭证是临时的）：
+**在有浏览器的机器上**（不是 Cloud Shell 里 —— Cloud Shell 的 gcloud 凭证是临时的，`credentials.db` 里 0 行）：
 
 ```bash
 gcloud auth application-default login \
@@ -49,6 +49,20 @@ cat ~/.config/gcloud/application_default_credentials.json
   "refresh_token": "1//...."
 }
 ```
+
+### ⚠️ 认证的坑（已踩并修复）
+
+| 凭证类型 | 可用命令 | 说明 |
+|---|---|---|
+| `authorized_user`（ADC） | `gcloud auth activate-refresh-token` | **不能用** `--cred-file` |
+| `service_account` | `gcloud auth activate-service-account --key-file` | SA 调不了 `users/me/*` |
+| `external_account` | `gcloud auth login --cred-file` | workload identity pool |
+
+`gcloud auth login --cred-file` 会报：
+`Invalid value for [--cred-file]: Only external account or service account JSON credential file types are supported.`
+
+所以脚本按 `type` 字段分支处理，workflow 里也做了同样判断。
+`users/me/environments` 是**用户级 API**，service account 无法调用，必须用你本人的凭证。
 
 ### 2. 建仓库并推 workflow
 
@@ -72,7 +86,17 @@ gh secret set TG_BOT_TOKEN --repo <你的账号>/cloudshell-keepalive --body "12
 gh secret set TG_CHAT_ID  --repo <你的账号>/cloudshell-keepalive --body "123456789"
 ```
 
-### 4. 手动触发一次验证
+### 4. 已创建好的仓库
+
+本方案已实际部署并验证：
+
+```
+https://github.com/lws666/cloudshell-keepalive   (private)
+```
+
+只差填入真实 `GCP_CRED_JSON`，配完即自动运行。
+
+### 5. 手动触发一次验证
 
 ```bash
 gh workflow run keepalive.yml --repo <你的账号>/cloudshell-keepalive
@@ -134,3 +158,30 @@ CI 的 `ssh` 动作里带了 `ka-start.sh`，所以会话被回收后重建时�
 - `GCP_CRED_JSON` 等价于你账号的长期访问权，只放私有仓库 Secrets。
 - 用完可撤销：`curl -X POST https://oauth2.googleapis.com/revoke -d "token=<refresh_token>"`
 - 别把它写进代码、日志、issue 或聊天窗口。
+
+
+## 实测记录
+
+| 环节 | 结果 |
+|---|---|
+| workflow 注册 | ✓（踩过坑：`schedule` 列表内插注释会导致整个 workflow 不被注册） |
+| checkout / setup-gcloud | ✓ |
+| 凭证写入 | ✓ 缺 secret 时报 `missing secret GCP_CRED_JSON` 并退出 |
+| 凭证类型识别 | ✓ 正确识别 `authorized_user` |
+| refresh token 激活 | ✓ 走对命令（假 token 被 Google 拒绝属预期） |
+| API 调用链 | ✓ mock 验证 `POST :start` 带 accessToken → 轮询 operations |
+| 端到端 | 待真实凭证 |
+
+### 另一个坑：workflow 不注册
+
+`on.schedule` 下面插注释会让 GitHub Actions 解析器拒绝整个文件：
+
+```yaml
+on:
+  schedule:
+    # ← 这行注释会导致 workflow 不被注册
+    - cron: '*/25 * * * *'
+```
+
+现象：`actions/workflows` 返回 `total_count: 0`，`gh workflow run` 报 404。
+解决：把注释移到 `on:` 之前。
