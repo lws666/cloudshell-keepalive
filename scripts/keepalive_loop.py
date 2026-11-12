@@ -199,6 +199,15 @@ def main():
     log(f"预计结束: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC + {HOURS}h")
     log("=" * 52)
 
+    # 预检：一次都拿不到 token 就直接失败退出。
+    # 否则凭证失效时 job 会白占 5 小时 GitHub 额度。
+    log("预检: 取 access token ...")
+    if not get_token():
+        log("预检失败: 完全取不到 token（凭证无效或已撤销），立即退出，不占额度")
+        notify("❌ <b>Cloud Shell 保活启动失败</b>\n凭证无效，无法取 token")
+        return 1
+    log("预检通过")
+
     start_ts = time.time()
     ok_count = 0
     fail_streak = 0

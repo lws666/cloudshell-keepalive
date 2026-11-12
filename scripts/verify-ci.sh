@@ -45,20 +45,23 @@ assert interval > 0 and interval <= 30, f"间隔 {interval}min 太大，压不�
 PYEOF
 
 echo "═══ 3. Python 脚本 ═══"
-python3 -m py_compile scripts/cloudshell_keepalive.py && ok "语法通过" || bad "语法错误"
-grep -q 'ENV_NAME}:start' scripts/cloudshell_keepalive.py && ok "含 :start API" || bad "缺 :start"
-grep -q "ENV_NAME}:authorize" scripts/cloudshell_keepalive.py && ok "含 :authorize API" || bad "缺 :authorize"
-grep -q "cloud-shell.*ssh" scripts/cloudshell_keepalive.py && ok "含 ssh 动作" || bad "缺 ssh"
+python3 -m py_compile scripts/keepalive_loop.py && ok "语法通过" || bad "语法错误"
+grep -q 'ENV_NAME}:start' scripts/keepalive_loop.py && ok "含 :start API" || bad "缺 :start"
+grep -q "ENV_NAME}:authorize" scripts/keepalive_loop.py && ok "含 :authorize API" || bad "缺 :authorize"
+grep -q "cloud-shell.*ssh" scripts/keepalive_loop.py && ok "含 ssh 动作" || bad "缺 ssh"
 
 echo "═══ 4. Shell 脚本 ═══"
 for f in scripts/*.sh; do
   bash -n "$f" && ok "$f 语法通过" || bad "$f 语法错误"
 done
 
-echo "═══ 5. 无凭证时的失败行为 ═══"
-out=$(env -u GCP_CRED_JSON -u GCS_ACCESS_TOKEN python3 scripts/cloudshell_keepalive.py 2>&1); rc=$?
-[[ $rc -eq 1 ]] && ok "无凭证时 rc=1（会红，能告警）" || bad "无凭证时 rc=$rc，行为不对"
-echo "$out" | grep -q "无可用凭证" && ok "给出了明确原因" || bad "错误信息不清"
+echo "═══ 5. 无凭证快速失败（不白占 CI 额度）═══"
+t0=$(date +%s)
+out=$(timeout 60 env -u GCP_CRED_JSON python3 scripts/keepalive_loop.py 2>&1); rc=$?
+t1=$(date +%s); dur=$((t1-t0))
+[[ $rc -eq 1 ]] && ok "无凭证时 rc=1" || bad "无凭证时 rc=$rc，行为不对"
+(( dur < 60 )) && ok "1 秒级退出（实际 ${dur}s），不会白占 5h 额度" || bad "耗时 ${dur}s，会白占额度"
+echo "$out" | grep -q "预检失败" && ok "给出明确原因" || bad "错误信息不清"
 
 echo "═══ 6. secret 引用与 workflow 一致 ═══"
 for s in GCP_CRED_JSON GCP_PROJECT TG_BOT_TOKEN TG_CHAT_ID; do
