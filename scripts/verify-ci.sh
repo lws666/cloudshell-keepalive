@@ -17,14 +17,32 @@ assert any('checkout' in str(s.get('uses','')) for s in j['steps'])
 print("  steps:", len(j['steps']))
 PY
 
-echo "═══ 2. cron 表达式 ═══"
-cron=$(python3 -c "
-import yaml
-d=yaml.safe_load(open('.github/workflows/keepalive.yml'))
-on=d.get('on') or d.get(True)
-print(on['schedule'][0]['cron'])")
-echo "  cron=$cron"
-[[ "$cron" == "*/25 * * * *" ]] && ok "每 25 分钟（< 40 分钟空闲线）" || bad "cron 间隔过大"
+echo "═══ 2. 保活架构 ═══"
+python3 - <<'PYEOF' && ok "架构正确（单 job 循环，不依赖 cron 精度）" || bad "架构不对"
+import yaml, sys
+d = yaml.safe_load(open('.github/workflows/keepalive.yml'))
+on = d.get('on') or d.get(True)
+crons = [x['cron'] for x in on['schedule']]
+print("  crons:", crons)
+# 关键: 必须是循环脚本，不能靠 cron 做 25 分钟心跳
+steps = str(d['jobs']['keepalive']['steps'])
+assert 'keepalive_loop.py' in steps, "没用循环脚本"
+timeout = d['jobs']['keepalive']['timeout-minutes']
+print(f"  job timeout: {timeout}min")
+assert timeout >= 300, "job 时长不足以覆盖 5h"
+# cron 只负责开窗口，小时级即可
+assert len(crons) == 1 and '*/4' in crons[0], f"cron 应约每 4 小时一次: {crons}"
+PYEOF
+
+echo "═══ 2b. 循环参数 ═══"
+python3 - <<'PYEOF' && ok "循环参数合理（20min < 40min 空闲线）" || bad "循环间隔过大"
+import re
+src = open('scripts/keepalive_loop.py').read()
+m = re.search(r'INTERVAL_MIN.*?"(\d+)"', src)
+interval = int(m.group(1)) if m else 0
+print(f"  默认间隔: {interval}min")
+assert interval > 0 and interval <= 30, f"间隔 {interval}min 太大，压不住 40min 空闲线"
+PYEOF
 
 echo "═══ 3. Python 脚本 ═══"
 python3 -m py_compile scripts/cloudshell_keepalive.py && ok "语法通过" || bad "语法错误"
