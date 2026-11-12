@@ -105,29 +105,49 @@ gh run watch --repo <你的账号>/cloudshell-keepalive
 
 看到 `start=✓ authorize=✓ ssh=✓` 就通了，之后每 25 分钟自动跑。
 
-## 三级保活动作
+## 循环内每轮动作
 
 脚本 `scripts/cloudshell_keepalive.py` 按强度递增执行：
 
-| 动作 | API / 命令 | 作用 |
-|---|---|---|
-| A `start` | `POST :start` | 启动或复用环境，带 token 预授权 |
-| B `authorize` | `POST :authorize` | 给运行中的环境换新 token，**不重启 VM** |
-| C `ssh` | `gcloud cloud-shell ssh --command` | 真跑远端命令，产生真实活动 + 顺带拉起远端 `ka.sh` |
+| 动作 | API / 命令 | 频率 | 作用 |
+|---|---|---|---|
+| `authorize` | `POST :authorize` | 每轮 | 换新 token，**不重启 VM**，最轻量 |
+| `start` | `POST :start` | authorize 失败时 | 环境没了就起，带 token 预授权 |
+| `ssh` | `gcloud cloud-shell ssh` | 每 3 轮 | 真跑远端命令 + 顺带拉起远端 `ka.sh` |
 
-`KEEPALIVE_MODE` 可只跑其中一个：`start` / `authorize` / `ssh` / `all`（默认）。
+失败退避：连续 3 轮失败 → 间隔翻倍（上限 30 分钟）→ 并发 Telegram 告警。
 
-## 频率为什么是 25 分钟
+## 为什么不用 "每 25 分钟 cron"（关键修正）
 
-| 限制 | 值 | 说明 |
-|---|---|---|
-| 非交互空闲 | 40 分钟 | 25 分钟 × 安全余量足够 |
-| 交互空闲 | 约 1 小时 | 同上 |
-| 会话硬上限 | 12 小时 | 本地和 CI 都无法突破 |
-| 每周配额 | 50 小时 | Google 侧硬限制 |
+最初按 25 分钟 cron 设计，**实测失败**：
 
-GitHub Actions 免费额度的 cron 有 5–15 分钟漂移，25 分钟能稳稳压在 40 分钟线内。
-cron 最小粒度是 5 分钟，别想着更密。
+| 日期 | 相邻 schedule 间隔 |
+|---|---|
+| 11-10 18:52 → 23:51 | 5.0 h |
+| 11-10 23:51 → 11-11 04:14 | 4.4 h |
+| 11-11 04:14 → 11:57 | **7.7 h** |
+| 11-11 11:57 → 19:22 | 7.4 h |
+| 11-11 19:22 → 11-12 01:35 | 6.2 h |
+| 11-12 01:35 → 08:51 | 7.3 h |
+
+GitHub 免费额度的 `schedule` 是 best-effort：低活跃仓库、排队高峰时会被大幅延迟。
+**25 分钟配置实际跑成 4–8 小时一次，完全压不住 40 分钟空闲线。**
+
+### 改用的方案：单 job 内循环
+
+```
+cron 每 4 小时  →  启动一个 job
+                      ↓
+                   job 内循环 5 小时，每 20 分钟 poke 一次
+                      ↓
+                   覆盖整个保活窗口
+```
+
+- GitHub 单 job 上限 **6 小时** → 取 5 小时（`timeout-minutes: 355`）
+- 循环内 20 分钟一轮，稳稳压在 40 分钟空闲线内
+- cron 精度要求降到**小时级**，免费额度完全够用
+- 还省额度：原来 24h 要触发 57 次，现在 6 次
+
 
 ## 与本地保活的关系
 
@@ -185,3 +205,35 @@ on:
 
 现象：`actions/workflows` 返回 `total_count: 0`，`gh workflow run` 报 404。
 解决：把注释移到 `on:` 之前。
+
+
+## 第 3 天复盘：两个致命问题（已修）
+
+### 问题 1：开机钩子卡死，守护从未恢复
+
+**现象**：VM 在 13:30 重启，`customize_environment_done` 有创建时间戳，
+但 `boot.log` 停在两天前，守护进程不存在。
+
+**根因**：`dsh-start.sh` 结尾是 `exec node ...`（前台阻塞）。
+钩子里写 `nohup bash dsh-start.sh &` 仍会被钩子等待，导致后面的
+`ka-start.sh` 永远轮不到执行。钩子被卡住 → Cloud Shell 视为未完成 → 守护永不启动。
+
+**修复**：
+```bash
+setsid nohup bash dsh-start.sh --no-clean >> log 2>&1 < /dev/null &
+```
+`setsid` 脱离进程组 + `< /dev/null` 断开 stdin，钩子 3.1 秒即返回。
+
+**验证**：改后实测钩子 3.1s 完成，DSH 就绪、tmux 就绪、守护 pid 正常。
+
+### 问题 2：CI cron 精度不可靠
+
+见上面「为什么不用每 25 分钟 cron」章节。
+
+### 教训
+
+| 假设 | 实际 | 修正 |
+|---|---|---|
+| GitHub cron 能稳定 25 分钟 | 实际 4–8 小时 | 改单 job 循环 |
+| `nohup ... &` 就够后台化 | `exec` 进程仍阻塞父脚本 | 必须 `setsid` |
+| 钩子会每天/每次登录都跑 | 只在 VM 开机跑一次 | 不能依赖它做周期任务 |
