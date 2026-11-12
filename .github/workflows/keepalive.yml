@@ -4,24 +4,33 @@ name: Cloud Shell 自动保活
 #   ClawCloud 靠 Playwright 登录网页；Cloud Shell 有官方 REST API，
 #   所以用 users.environments.start / authorize + cloud-shell ssh 完成保活。
 #
-# 调度：每 25 分钟一次，压住 Cloud Shell 的 40 分钟非交互空闲线。
-# 远端另有 ka.sh（5 小时自退）负责进程级保活，两层互补。
+# ═══ 为什么不用 "每 25 分钟一次 cron" 做心跳 ═══
+#   实测：GitHub 免费额度的 schedule 触发被大幅延迟，实际间隔 4.4-7.7 小时，
+#   完全无法压住 Cloud Shell 的 40 分钟空闲线。
+#   → 改为「单次 job 内循环 5 小时」：GitHub 单 job 上限 6 小时，
+#     一次触发就覆盖整个 5 小时保活窗口，彻底绕开 cron 不准的问题。
+#   → cron 只负责「每天启动几次窗口」，精度要求降到小时级，免费额度够用。
 #
-# 注意：schedule 与 workflow_dispatch 之间不要插入注释，
-#       GitHub Actions 的 workflow 解析器对列表内的注释敏感，会导致整个
-#       workflow 不被注册（actions/workflows 返回 0 条，workflow run 报 404）。
+# ═══ 三层防线 ═══
+#   1. CI 循环  每 20 分钟 poke 一次，持续 5 小时（主防线）
+#   2. cron     每 3.5 小时尝试开一个新窗口（失败也无所谓，下一轮补）
+#   3. 远端 ka.sh 进程级保活 DSH(3080)/代理(3081)（配合使用）
+#
+# 注意：schedule 列表内不要插注释，GitHub 解析器会拒绝注册整个 workflow。
 
 on:
   schedule:
-    - cron: '*/25 * * * *'
+    - cron: '17 */4 * * *'
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'keepalive action: all / start / authorize / ssh'
+      hours:
+        description: 'run duration in hours (max 5.5)'
         required: false
-        default: 'all'
-        type: choice
-        options: [all, start, authorize, ssh]
+        default: '5'
+      interval:
+        description: 'poke interval in minutes'
+        required: false
+        default: '20'
 
 concurrency:
   group: cloudshell-keepalive
@@ -33,7 +42,7 @@ permissions:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 355
 
     steps:
       - name: Checkout
@@ -69,7 +78,6 @@ jobs:
             service_account)
               gcloud auth activate-service-account --key-file "$HOME/.gcp_cred.json" ;;
             authorized_user)
-              # --cred-file 不接受 authorized_user，必须走 activate-refresh-token
               ACCT=$(python3 -c "import json,os;b=json.loads(os.environ['GCP_CRED_JSON']);print(b.get('account') or b.get('client_email') or 'ci@local')")
               RT=$(python3 -c "import json,os;print(json.loads(os.environ['GCP_CRED_JSON'])['refresh_token'])")
               gcloud auth activate-refresh-token "$ACCT" "$RT" ;;
@@ -92,21 +100,21 @@ jobs:
             echo "no GCP_PROJECT secret, using default"
           fi
 
-      - name: Run keepalive
+      - name: Long-running keepalive loop
         env:
-          GCP_CRED_JSON: ${{ secrets.GCP_CRED_JSON }}
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-          KEEPALIVE_MODE: ${{ github.event.inputs.mode || 'all' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python3 scripts/cloudshell_keepalive.py
+          HOURS: ${{ github.event.inputs.hours || '5' }}
+          INTERVAL_MIN: ${{ github.event.inputs.interval || '20' }}
+        run: python3 scripts/keepalive_loop.py
 
       - name: Summary
         if: always()
         run: |
           {
             echo "### Cloud Shell keepalive"
-            echo "- mode: ${{ github.event.inputs.mode || 'all' }}"
+            echo "- mode: loop"
             echo "- trigger: ${{ github.event_name }}"
             echo "- time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           } >> "$GITHUB_STEP_SUMMARY"
