@@ -2,6 +2,8 @@
 
 对标 [oyz8/ClawCloud-Run](https://github.com/oyz8/ClawCloud-Run) 的 CI 保活思路，换成 Cloud Shell 的实现。
 
+**核心能力**：在 GitHub Actions 页面点一次按钮，远程启动 DSH（+Origin 改写代理），并连续保活 5 小时。
+
 ## 和 ClawCloud-Run 的对应关系
 
 | ClawCloud-Run | 本方案 |
@@ -12,11 +14,11 @@
 | 提取 Cookie 存回仓库 | 不落盘，token 每次现取 |
 | TG 通知验证码 | TG 通知保活结果 |
 
-**核心优势**：不需要人工批准 2FA、不需要手机守着、不需要浏览器页签常开。
+**优势**：不需要人工批准 2FA、不需要手机守着、不需要浏览器页签常开。
 
 ## 为什么这条路能成立
 
-Cloud Shell 有官方 REST API，且 `start` 支持传 `accessToken`：
+Cloud Shell 有官方 REST API，`start` 支持传 `accessToken`：
 
 ```
 POST https://cloudshell.googleapis.com/v1/users/me/environments/default:start
@@ -24,33 +26,57 @@ POST https://cloudshell.googleapis.com/v1/users/me/environments/default:start
 ```
 
 传了 `accessToken` 后环境「预先完成 gcloud 认证」，不需要走网页登录和 2FA。
-这就是 CI 能独立完成保活的根本原因。
+这是 CI 能独立完成保活的根本原因。
 
-## 快速部署
+## 架构
+
+```
+GitHub Actions
+├── workflow_dispatch（手动按钮）  ← 主力：点一下跑 5 小时
+└── schedule  '17 */6 * * *'      ← 兜底：每 6 小时尝试开窗口
+        │
+        ├─ 1. Sync remote scripts  把脚本推到 Cloud Shell
+        ├─ 2. Start DSH on remote  执行 ~/dsh-cloudshell-start.sh
+        │                           start_dsh_rc + remote_3080 双重校验
+        └─ 3. Keepalive loop       5 小时内每 20 分钟 poke 一次
+                ├── authorize     换新 token（不重启 VM，最轻量）
+                ├── start         环境没了才起
+                └── ssh           每 3 轮真跑命令 + 拉起远端 ka.sh
+                        │
+                        └── 远端 ka.sh  进程级保活 3080/3081
+```
+
+## 一键使用
+
+Actions 页面 → **Run workflow** → 参数保持默认：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `hours` | 5 | 保活时长（上限 5.5，GitHub 单 job 硬上限 6h） |
+| `interval` | 20 | 每轮间隔分钟（必须 < 40，Cloud Shell 空闲线） |
+| `start_dsh` | true | 同时启动 DSH + 代理 |
+
+手动触发即「一键启动 DSH 并保活 5 小时」。
+
+## 部署步骤
 
 ### 1. 生成凭证
 
-**在有浏览器的机器上**（不是 Cloud Shell 里 —— Cloud Shell 的 gcloud 凭证是临时的，`credentials.db` 里 0 行）：
+在 **有浏览器的机器** 上导出 ADC（Cloud Shell 内的 gcloud 凭证是临时的，`credentials.db` 0 行）：
 
 ```bash
 gcloud auth application-default login \
   --scopes=https://www.googleapis.com/auth/cloud-platform
-
 cat ~/.config/gcloud/application_default_credentials.json
 ```
 
-得到一个 `authorized_user` 类型的 JSON：
+或者在 Cloud Shell 里直接用仓库脚本交互获取（30 秒）：
 
-```json
-{
-  "type": "authorized_user",
-  "client_id": "....apps.googleusercontent.com",
-  "client_secret": "....",
-  "refresh_token": "1//...."
-}
+```bash
+bash scripts/get-cred.sh        # 打印授权链接，浏览器打开后贴回验证码
 ```
 
-### ⚠️ 认证的坑（已踩并修复）
+### ⚠️ 认证的坑
 
 | 凭证类型 | 可用命令 | 说明 |
 |---|---|---|
@@ -59,65 +85,59 @@ cat ~/.config/gcloud/application_default_credentials.json
 | `external_account` | `gcloud auth login --cred-file` | workload identity pool |
 
 `gcloud auth login --cred-file` 会报：
-`Invalid value for [--cred-file]: Only external account or service account JSON credential file types are supported.`
+`Only external account or service account JSON credential file types are supported.`
 
-所以脚本按 `type` 字段分支处理，workflow 里也做了同样判断。
 `users/me/environments` 是**用户级 API**，service account 无法调用，必须用你本人的凭证。
+workflow 里按 `type` 字段自动分支处理。
 
-### 2. 建仓库并推 workflow
+### 2. 启用 Cloud Shell API（必须）
+
+这一步容易漏，漏了会一直 403：
 
 ```bash
-mkdir -p ~/keepalive-ci/.github/workflows
-cd ~/keepalive-ci
-git init && git add -A && git commit -m "cloudshell keepalive"
-gh repo create cloudshell-keepalive --private --source=. --push
+gcloud services enable cloudshell.googleapis.com --project=<你的项目ID>
 ```
+
+本仓库实测时该 API 初始状态是 `DISABLED`。
 
 ### 3. 配置 Secrets
 
 ```bash
-gh secret set GCP_CRED_JSON --repo <你的账号>/cloudshell-keepalive \
+gh secret set GCP_CRED_JSON --repo lws666/cloudshell-keepalive \
   < ~/.config/gcloud/application_default_credentials.json
-
-gh secret set GCP_PROJECT --repo <你的账号>/cloudshell-keepalive --body "你的项目ID"
+gh secret set GCP_PROJECT --repo lws666/cloudshell-keepalive --body "你的项目ID"
 
 # 可选：Telegram 通知
-gh secret set TG_BOT_TOKEN --repo <你的账号>/cloudshell-keepalive --body "123:AAH..."
-gh secret set TG_CHAT_ID  --repo <你的账号>/cloudshell-keepalive --body "123456789"
+gh secret set TG_BOT_TOKEN --repo lws666/cloudshell-keepalive --body "123:AAH..."
+gh secret set TG_CHAT_ID  --repo lws666/cloudshell-keepalive --body "123456789"
 ```
 
-### 4. 已创建好的仓库
-
-本方案已实际部署并验证：
+### 4. 已部署仓库
 
 ```
 https://github.com/lws666/cloudshell-keepalive   (private)
 ```
 
-只差填入真实 `GCP_CRED_JSON`，配完即自动运行。
+## 目录结构
 
-### 5. 手动触发一次验证
-
-```bash
-gh workflow run keepalive.yml --repo <你的账号>/cloudshell-keepalive
-gh run watch --repo <你的账号>/cloudshell-keepalive
+```
+.
+├── .github/workflows/keepalive.yml   # 主 workflow
+├── start/
+│   └── dsh-cloudshell-start.sh       # 一键启动 DSH+代理+隧道（无 kill，幂等）
+├── scripts/
+│   ├── keepalive_loop.py             # 5 小时保活循环（含凭证预检）
+│   ├── get-cred.sh                   # 交互式获取 refresh token
+│   ├── verify-ci.sh                  # 本地预检（19 项）
+│   └── remote/                       # 推送到远端的保活脚本
+│       ├── ka.sh
+│       ├── ka-start.sh
+│       ├── ka-stop.sh
+│       └── ka-status.sh
+└── README.md
 ```
 
-看到 `start=✓ authorize=✓ ssh=✓` 就通了，之后每 25 分钟自动跑。
-
-## 循环内每轮动作
-
-脚本 `scripts/cloudshell_keepalive.py` 按强度递增执行：
-
-| 动作 | API / 命令 | 频率 | 作用 |
-|---|---|---|---|
-| `authorize` | `POST :authorize` | 每轮 | 换新 token，**不重启 VM**，最轻量 |
-| `start` | `POST :start` | authorize 失败时 | 环境没了就起，带 token 预授权 |
-| `ssh` | `gcloud cloud-shell ssh` | 每 3 轮 | 真跑远端命令 + 顺带拉起远端 `ka.sh` |
-
-失败退避：连续 3 轮失败 → 间隔翻倍（上限 30 分钟）→ 并发 Telegram 告警。
-
-## 为什么不用 "每 25 分钟 cron"（关键修正）
+## 为什么不用「每 25 分钟 cron」
 
 最初按 25 分钟 cron 设计，**实测失败**：
 
@@ -130,110 +150,80 @@ gh run watch --repo <你的账号>/cloudshell-keepalive
 | 11-11 19:22 → 11-12 01:35 | 6.2 h |
 | 11-12 01:35 → 08:51 | 7.3 h |
 
-GitHub 免费额度的 `schedule` 是 best-effort：低活跃仓库、排队高峰时会被大幅延迟。
+GitHub 免费额度的 `schedule` 是 best-effort，低活跃仓库会被大幅延迟。
 **25 分钟配置实际跑成 4–8 小时一次，完全压不住 40 分钟空闲线。**
 
 ### 改用的方案：单 job 内循环
 
 ```
-cron 每 4 小时  →  启动一个 job
+cron 每 6 小时  →  启动一个 job
                       ↓
                    job 内循环 5 小时，每 20 分钟 poke 一次
-                      ↓
-                   覆盖整个保活窗口
 ```
 
 - GitHub 单 job 上限 **6 小时** → 取 5 小时（`timeout-minutes: 355`）
-- 循环内 20 分钟一轮，稳稳压在 40 分钟空闲线内
 - cron 精度要求降到**小时级**，免费额度完全够用
-- 还省额度：原来 24h 要触发 57 次，现在 6 次
+- 配额：5h × 每天 4 次 ≈ 20h/周，安全低于 50h 硬限制
 
+## 踩过的坑（全部已修）
 
-## 与本地保活的关系
+### 1. `| tail -N` 吞掉退出码 → 假 success
 
-两层互补，不是二选一：
-
-```
-CI（每 25 分钟）  →  防 Cloud Shell 会话被回收
-   ↓ 会话活着
-远端 ka.sh        →  防 DSH(3080)/代理(3081) 进程死掉
+```bash
+gcloud cloud-shell ssh ... | tail -30     # ✗ gcloud 失败也显示 success
 ```
 
-CI 的 `ssh` 动作里带了 `ka-start.sh`，所以会话被回收后重建时，
-远端服务会自动跟着起来。
+管道把退出码换成 `tail` 的（恒为 0）。曾经导致 `Start DSH on remote => success`
+但 DSH 实际没启动，误导排查很久。
 
-## 故障对照
+修复：先落文件再取尾部 + 显式检查 `$?` + 执行后二次探测远端 3080。
 
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| `缺少 secret GCP_CRED_JSON` | Secrets 没配 | 按第 3 步配 |
-| `凭证无效` | refresh token 过期/被撤销 | 重跑第 1 步换新 |
-| `HTTP 403` on `:start` | 项目未启用 Cloud Shell API 或账号权限不足 | 控制台启用 Cloud Shell API |
-| `HTTP 429` | 配额超了 | 查 `Session information → Usage quota` |
-| `ssh 失败` | SSH key 首次未生成 | 本地先手动跑一次 `gcloud cloud-shell ssh` |
-| `operation 超时` | 环境启动慢 | 属正常，下次运行会复用已启动的环境 |
+### 2. `schedule` 列表内插注释 → workflow 不注册
 
-## 安全注意
+```yaml
+on:
+  schedule:
+    # 这行注释会导致整个 workflow 不被注册
+    - cron: '*/25 * * * *'
+```
 
-- `GCP_CRED_JSON` 等价于你账号的长期访问权，只放私有仓库 Secrets。
-- 用完可撤销：`curl -X POST https://oauth2.googleapis.com/revoke -d "token=<refresh_token>"`
-- 别把它写进代码、日志、issue 或聊天窗口。
+现象：`actions/workflows` 返回 `total_count: 0`，`gh workflow run` 报 404。
+修复：注释移到 `on:` 之前。
 
+### 3. 开机钩子被 `exec` 阻塞 → 守护从未恢复
+
+`dsh-start.sh` 结尾是 `exec node`（前台阻塞）。钩子里写 `nohup ... &` 仍会被等待，
+导致后面的 `ka-start.sh` 永远轮不到执行。
+
+修复：`setsid nohup ... < /dev/null &`，钩子 3.1 秒返回。
+
+### 4. bash 算术不支持小数
+
+`HOURS=0.05` 时 `$(( HOURS * 3600 ))` 直接报错，导致短时长测试全挂。
+
+修复：改用 `awk -v h="$HOURS" 'BEGIN{printf "%d", h*3600}'`。
+
+### 5. 凭证失效时白占 5 小时额度
+
+修复：主循环前加零成本预检（检查凭证文件 / ACTIVE 账号），无凭证秒级退出。
+
+## 安全
+
+- `dsh-cloudshell-start.sh` **无 `kill`/`pkill`**，对已运行服务走「跳过」分支，CI 反复触发安全。
+- 别在会话内 kill 3080 —— 那是承载 DSH 本体的进程。
+- `GCP_CRED_JSON` 等价于账号长期访问权，只放私有仓库 Secrets。
+- 撤销：`bash scripts/get-cred.sh --revoke`
 
 ## 实测记录
 
 | 环节 | 结果 |
 |---|---|
-| workflow 注册 | ✓（踩过坑：`schedule` 列表内插注释会导致整个 workflow 不被注册） |
+| workflow 注册 | ✓ |
 | checkout / setup-gcloud | ✓ |
-| 凭证写入 | ✓ 缺 secret 时报 `missing secret GCP_CRED_JSON` 并退出 |
-| 凭证类型识别 | ✓ 正确识别 `authorized_user` |
-| refresh token 激活 | ✓ 走对命令（假 token 被 Google 拒绝属预期） |
-| API 调用链 | ✓ mock 验证 `POST :start` 带 accessToken → 轮询 operations |
-| 端到端 | 待真实凭证 |
-
-### 另一个坑：workflow 不注册
-
-`on.schedule` 下面插注释会让 GitHub Actions 解析器拒绝整个文件：
-
-```yaml
-on:
-  schedule:
-    # ← 这行注释会导致 workflow 不被注册
-    - cron: '*/25 * * * *'
-```
-
-现象：`actions/workflows` 返回 `total_count: 0`，`gh workflow run` 报 404。
-解决：把注释移到 `on:` 之前。
-
-
-## 第 3 天复盘：两个致命问题（已修）
-
-### 问题 1：开机钩子卡死，守护从未恢复
-
-**现象**：VM 在 13:30 重启，`customize_environment_done` 有创建时间戳，
-但 `boot.log` 停在两天前，守护进程不存在。
-
-**根因**：`dsh-start.sh` 结尾是 `exec node ...`（前台阻塞）。
-钩子里写 `nohup bash dsh-start.sh &` 仍会被钩子等待，导致后面的
-`ka-start.sh` 永远轮不到执行。钩子被卡住 → Cloud Shell 视为未完成 → 守护永不启动。
-
-**修复**：
-```bash
-setsid nohup bash dsh-start.sh --no-clean >> log 2>&1 < /dev/null &
-```
-`setsid` 脱离进程组 + `< /dev/null` 断开 stdin，钩子 3.1 秒即返回。
-
-**验证**：改后实测钩子 3.1s 完成，DSH 就绪、tmux 就绪、守护 pid 正常。
-
-### 问题 2：CI cron 精度不可靠
-
-见上面「为什么不用每 25 分钟 cron」章节。
-
-### 教训
-
-| 假设 | 实际 | 修正 |
-|---|---|---|
-| GitHub cron 能稳定 25 分钟 | 实际 4–8 小时 | 改单 job 循环 |
-| `nohup ... &` 就够后台化 | `exec` 进程仍阻塞父脚本 | 必须 `setsid` |
-| 钩子会每天/每次登录都跑 | 只在 VM 开机跑一次 | 不能依赖它做周期任务 |
+| 凭证写入与激活 | ✓ 自动识别 `authorized_user` 并走 `activate-refresh-token` |
+| Cloud Shell API | ✓ 从 `DISABLED` 启用为 `ENABLED` |
+| `environments:start` | ✓ 返回 `done: true`，环境 `RUNNING` |
+| `environments:authorize` | ✓ `done: true` |
+| 一键启动 DSH | ✓ `start_dsh_rc=0` / `remote_3080=401` / `ka_start_rc=0` |
+| 保活循环 | ✓ 3 轮全成功，`authorize` + `ssh` 均生效 |
+| 本地预检 | ✓ 19 项全通过 |
