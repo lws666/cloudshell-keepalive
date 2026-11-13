@@ -31,7 +31,7 @@ timeout = d['jobs']['keepalive']['timeout-minutes']
 print(f"  job timeout: {timeout}min")
 assert timeout >= 300, "job 时长不足以覆盖 5h"
 # cron 只负责开窗口，小时级即可
-assert len(crons) == 1 and '*/4' in crons[0], f"cron 应约每 4 小时一次: {crons}"
+assert len(crons) == 1 and '*/6' in crons[0], f"cron 应约每 6 小时一次（周配额安全）: {crons}"
 PYEOF
 
 echo "═══ 2b. 循环参数 ═══"

@@ -1,4 +1,4 @@
-name: Cloud Shell 自动保活
+name: Cloud Shell 一键启动 DSH + 保活
 
 # 对照 ClawCloud-Run 的 auto_login.yml：
 #   ClawCloud 靠 Playwright 登录网页；Cloud Shell 有官方 REST API，
@@ -9,28 +9,39 @@ name: Cloud Shell 自动保活
 #   完全无法压住 Cloud Shell 的 40 分钟空闲线。
 #   → 改为「单次 job 内循环 5 小时」：GitHub 单 job 上限 6 小时，
 #     一次触发就覆盖整个 5 小时保活窗口，彻底绕开 cron 不准的问题。
-#   → cron 只负责「每天启动几次窗口」，精度要求降到小时级，免费额度够用。
+#
+# ═══ 两种运行方式 ═══
+#   1. 手动（推荐）：Actions 页面点 "Run workflow" 按钮
+#        - 默认就是「一键启动 DSH + 保活 5 小时」
+#        - 只需填 hours（默认 5），点绿色按钮即可
+#   2. 自动：cron 每 6 小时尝试开一个窗口
+#        - 每 job 5h × 每天 4 次 = 约 20h/周，安全低于 50h 配额
 #
 # ═══ 三层防线 ═══
 #   1. CI 循环  每 20 分钟 poke 一次，持续 5 小时（主防线）
-#   2. cron     每 3.5 小时尝试开一个新窗口（失败也无所谓，下一轮补）
+#   2. cron     每 6 小时尝试开一个新窗口
 #   3. 远端 ka.sh 进程级保活 DSH(3080)/代理(3081)（配合使用）
 #
 # 注意：schedule 列表内不要插注释，GitHub 解析器会拒绝注册整个 workflow。
 
 on:
   schedule:
-    - cron: '17 */4 * * *'
+    - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
       hours:
-        description: 'run duration in hours (max 5.5)'
+        description: '保活时长（小时，默认 5，上限 5.5）'
         required: false
         default: '5'
       interval:
-        description: 'poke interval in minutes'
+        description: '每轮间隔（分钟，默认 20）'
         required: false
         default: '20'
+      start_dsh:
+        description: '同时启动 DSH(3080) 与代理(3081)'
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: cloudshell-keepalive
@@ -100,6 +111,40 @@ jobs:
             echo "no GCP_PROJECT secret, using default"
           fi
 
+      - name: Sync remote scripts
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: |
+          set -euo pipefail
+          PROJECT_ARG=""
+          [ -n "${GCP_PROJECT:-}" ] && PROJECT_ARG="--project=$GCP_PROJECT"
+
+          # 确保远端目录存在
+          gcloud cloud-shell ssh --quiet $PROJECT_ARG --command='mkdir -p $HOME/keepalive' || true
+
+          # 把远端启动脚本推上去（每次都用仓库版本覆盖，保证一致）
+          for f in scripts/remote-up.sh; do
+            echo "sync $f"
+            gcloud cloud-shell scp --quiet $PROJECT_ARG \
+              "localhost:$PWD/$f" "cloudshell:/tmp/$(basename "$f")"
+            gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+              --command="install -m 755 /tmp/$(basename "$f") \$HOME/keepalive/$(basename "$f")"
+          done
+          echo "remote scripts synced"
+
+      - name: Start DSH on remote
+        if: ${{ github.event.inputs.start_dsh != 'false' }}
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          HOURS: ${{ github.event.inputs.hours || '5' }}
+        run: |
+          set -euo pipefail
+          PROJECT_ARG=""
+          [ -n "${GCP_PROJECT:-}" ] && PROJECT_ARG="--project=$GCP_PROJECT"
+          echo "=== 一键启动 DSH + 代理 + 守护 (${HOURS}h) ==="
+          gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+            --command="bash \$HOME/keepalive/remote-up.sh --hours $HOURS" 2>&1 | tail -25
+
       - name: Long-running keepalive loop
         env:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
@@ -113,8 +158,12 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Cloud Shell keepalive"
-            echo "- mode: loop"
-            echo "- trigger: ${{ github.event_name }}"
-            echo "- time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "### Cloud Shell 保活"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 触发方式 | ${{ github.event_name }} |"
+            echo "| 保活时长 | ${{ github.event.inputs.hours || '5' }} 小时 |"
+            echo "| 启动 DSH | ${{ github.event.inputs.start_dsh || 'true' }} |"
+            echo "| 时间 | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
           } >> "$GITHUB_STEP_SUMMARY"
