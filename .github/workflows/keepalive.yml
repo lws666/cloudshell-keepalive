@@ -199,8 +199,10 @@ jobs:
           fi
 
           # ═══ 步骤 C: 二次确认 3080 真实应答 ═══
+          # 同理：只取 3 位数字，避开 gcloud 的尾随警告
           chk=$(gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-            --command='curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:3080/' 2>/dev/null | tr -d '\r' | tail -1)
+            --command='curl -s -o /dev/null -w "CODE_%{http_code}\n" --max-time 5 http://127.0.0.1:3080/' 2>/dev/null \
+            | tr -d '\r' | grep -oE 'CODE_[0-9]{3}' | head -1 | cut -d_ -f2)
           echo "remote_3080=$chk"
           if [ "$chk" = "000" ] || [ -z "$chk" ]; then
             echo "::error::远端 3080 无应答，DSH 未启动"
@@ -208,11 +210,14 @@ jobs:
           fi
 
           # ═══ 步骤 D: 确认 tmux worker 真的在跑（保活生效的前提）═══
+          # 注意: gcloud 会在末尾追加 "Automatic authentication..." 警告，
+          # 直接 tail -1 会取到警告文本（已踩）。必须 grep 精确提取。
           w=$(gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-            --command='tmux has-session -t dsh-keep 2>/dev/null && echo YES || echo NO' 2>/dev/null | tr -d '\r' | tail -1)
+            --command='tmux has-session -t dsh-keep 2>/dev/null && echo WORKER_YES || echo WORKER_NO' 2>/dev/null \
+            | tr -d '\r' | grep -oE 'WORKER_(YES|NO)' | head -1)
           echo "tmux_worker_alive=$w"
-          if [ "$w" != "YES" ]; then
-            echo "::warning::tmux worker 未就绪，保活可能失效（DSH 本身可用）"
+          if [ "$w" != "WORKER_YES" ]; then
+            echo "::warning::tmux worker 未就绪（tmux_worker_alive=$w），保活可能失效"
           fi
 
       - name: Long-running keepalive loop
