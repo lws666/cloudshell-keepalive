@@ -37,6 +37,36 @@
 #   之后走缓存路径, 秒级启动。
 #
 
+# ── node 解析（关键修复）──
+# 通过 `gcloud cloud-shell ssh --command` 调用本脚本时是非交互式 shell，
+# 不会加载 ~/.bashrc，因此 PATH 里没有 node：
+#     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:...
+#     nohup: failed to run command 'node': No such file or directory
+# 这是「工作流启动不了 DSH」的真正原因。故这里显式定位 node 并前置到 PATH。
+resolve_node() {
+  # 1) 已在 PATH
+  if command -v node >/dev/null 2>&1; then printf '%s' "$(command -v node)"; return 0; fi
+  # 2) nvm 的版本目录（取最高版本）
+  local c
+  for c in $(ls -d /usr/local/nvm/versions/node/*/bin/node 2>/dev/null | sort -rV); do
+    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  # 3) 常见位置
+  for c in /usr/local/bin/node /usr/bin/node "$HOME_DIR/.local/bin/node"; do
+    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+NODE_BIN="$(resolve_node || true)"
+if [ -n "$NODE_BIN" ]; then
+  # 把 node 所在目录前置到 PATH，让脚本内所有 `node`/`npx` 调用都能找到
+  PATH="$(dirname "$NODE_BIN"):$PATH"
+  export PATH
+  echo "[env] node=$NODE_BIN"
+else
+  echo "[env] 警告: 找不到 node，DSH 无法启动" >&2
+fi
+
 HOME_DIR="$HOME"
 LOCAL_BIN="$HOME_DIR/.local/bin"
 CACHE_DIR="$HOME_DIR/.cache/dsh"

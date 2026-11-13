@@ -49,6 +49,9 @@ if [[ -f start/dsh-cloudshell-start.sh ]]; then
   ok "start/dsh-cloudshell-start.sh 存在"
   grep -q 'dsh-cloudshell-start.sh' .github/workflows/keepalive.yml && ok "workflow 引用它" || bad "workflow 未引用"
   grep -qE '\bkill |pkill ' start/dsh-cloudshell-start.sh && bad "含 kill 操作（危险）" || ok "不含 kill（安全）"
+  # 关键：ssh --command 是非交互 shell，PATH 无 node，脚本必须自己定位
+  grep -q 'resolve_node' start/dsh-cloudshell-start.sh && ok "含 node 路径自解析（非交互必需）" || bad "缺 node 自解析 → 工作流启动会失败"
+  grep -q 'nvm/versions/node' .github/workflows/keepalive.yml && ok "workflow 显式补 PATH（双保险）" || bad "workflow 缺 PATH 兜底"
   grep -qE 'TUNNEL_TOKEN|PASSWORD|SECRET' start/dsh-cloudshell-start.sh && info "含 token 变量名（应为从文件读取）" || true
 else
   bad "缺 start/dsh-cloudshell-start.sh"

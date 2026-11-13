@@ -159,8 +159,11 @@ jobs:
           # 导致 gcloud 失败时本步骤仍显示 success（已踩）。改为先落文件再取尾部 + 显式检查 rc。
           echo "=== 一键启动 DSH（调用 ~/dsh-cloudshell-start.sh）==="
           set +e
+          # 注意: ssh --command 是非交互 shell，不加载 ~/.bashrc，PATH 里没有 node。
+          # 脚本自身已会定位 node；这里再显式补一次，双保险。
           gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-            --command='bash $HOME/dsh-cloudshell-start.sh' > /tmp/start-dsh.log 2>&1
+            --command='export PATH=/usr/local/nvm/versions/node/v26.13.0/bin:$PATH; bash $HOME/dsh-cloudshell-start.sh' \
+            > /tmp/start-dsh.log 2>&1
           rc=${PIPESTATUS[0]:-$?}
           set -e
           tail -30 /tmp/start-dsh.log 2>/dev/null || true
