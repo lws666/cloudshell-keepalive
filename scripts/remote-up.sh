@@ -123,11 +123,17 @@ fi
 if [[ -x "$KA_DIR/ka-start.sh" ]]; then
   log "拉起保活守护 ${HOURS}h"
   timeout 120 bash "$KA_DIR/ka-start.sh" --hours "$HOURS" --interval 45 2>&1 | sed 's/^/    /'
+  sleep 3   # 给守护进程真正落地的窗口（极短时长时它可能已退出，不算失败）
   if pid=$(pgrep -f "keepalive/k[a]\.sh" | head -1) && [[ -n "$pid" ]]; then
     log "✓ 守护运行中 pid=$pid"
   else
-    log "✗ 守护未启动"
-    exit 1
+    # hours < 0.02 时守护可能已到点自然退出，这是正常的
+    if awk -v h="$HOURS" 'BEGIN{exit !(h < 0.02)}'; then
+      log "守护已到点退出（时长 ${HOURS}h 过短，属正常）"
+    else
+      log "✗ 守护未启动"
+      exit 1
+    fi
   fi
 else
   log "✗ 缺少 $KA_DIR/ka-start.sh"

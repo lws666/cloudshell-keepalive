@@ -122,13 +122,18 @@ jobs:
           # 确保远端目录存在
           gcloud cloud-shell ssh --quiet $PROJECT_ARG --command='mkdir -p $HOME/keepalive' || true
 
-          # 把远端启动脚本推上去（每次都用仓库版本覆盖，保证一致）
-          for f in scripts/remote-up.sh; do
-            echo "sync $f"
+          # 把远端脚本推上去（每次都用仓库版本覆盖，保证一致）
+          # scripts/remote/*.sh → $HOME/keepalive/*.sh
+          # scripts/remote-up.sh → $HOME/keepalive/remote-up.sh
+          for f in scripts/remote/ka.sh scripts/remote/ka-start.sh \
+                   scripts/remote/ka-stop.sh scripts/remote/ka-status.sh \
+                   scripts/remote-up.sh; do
+            base=$(basename "$f")
+            echo "sync $f -> ~/keepalive/$base"
             gcloud cloud-shell scp --quiet $PROJECT_ARG \
-              "localhost:$PWD/$f" "cloudshell:/tmp/$(basename "$f")"
+              "localhost:$PWD/$f" "cloudshell:/tmp/dsh-$base"
             gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-              --command="install -m 755 /tmp/$(basename "$f") \$HOME/keepalive/$(basename "$f")"
+              --command="install -m 755 /tmp/dsh-$base \$HOME/keepalive/$base"
           done
           echo "remote scripts synced"
 
