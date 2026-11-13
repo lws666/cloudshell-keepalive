@@ -134,7 +134,8 @@ jobs:
 
           # 保活脚本
           for f in scripts/remote/ka.sh scripts/remote/ka-start.sh \
-                   scripts/remote/ka-stop.sh scripts/remote/ka-status.sh; do
+                   scripts/remote/ka-stop.sh scripts/remote/ka-status.sh \
+                   scripts/remote/ka-tmux.sh; do
             base=$(basename "$f")
             if [ -f "$f" ]; then
               gcloud cloud-shell scp --quiet $PROJECT_ARG \
@@ -155,24 +156,49 @@ jobs:
           PROJECT_ARG=""
           [ -n "${GCP_PROJECT:-}" ] && PROJECT_ARG="--project=$GCP_PROJECT"
 
-          # 注意: 不能用 `cmd | tail -N`，pipe 会把退出码换成 tail 的（恒为 0），
-          # 导致 gcloud 失败时本步骤仍显示 success（已踩）。改为先落文件再取尾部 + 显式检查 rc。
+          # ssh --command 是非交互 shell，不加载 ~/.bashrc，PATH 里没有 node。
+          # 脚本自身会 resolve_node；这里再补一次作双保险。
+          REMOTE_ENV='export PATH=/usr/local/nvm/versions/node/v26.13.0/bin:$PATH;'
+
+          # ═══ 步骤 A: 确保 tmux 保活 worker 存在 ═══
+          # 这是关键修复：tmux server 重启后 dsh-keep 会话会消失，
+          # 之前的 worker 随之丢失，导致必须人工启动。这里每次敲门都补回来。
+          echo "=== 检查 tmux 保活 worker ==="
+          set +e
+          gcloud cloud-shell ssh --quiet $PROJECT_ARG --command="$REMOTE_ENV
+            if tmux has-session -t dsh-keep 2>/dev/null; then
+              echo TMUX_WORKER=running
+            else
+              echo TMUX_WORKER=missing
+              if [ -x \$HOME/keepalive/ka-tmux.sh ]; then
+                bash \$HOME/keepalive/ka-tmux.sh start 2>&1 | tail -5
+                echo TMUX_START_rc=\$?
+              else
+                echo TMUX_START_rc=no-script
+              fi
+            fi" > /tmp/tmux-check.log 2>&1
+          trc=$?
+          set -e
+          grep -E "TMUX_WORKER|TMUX_START_rc|已启动|验证隔离|SID" /tmp/tmux-check.log | head -8 || tail -5 /tmp/tmux-check.log
+          echo "tmux_check_rc=$trc"
+
+          # ═══ 步骤 B: 启动 DSH（幂等，已在跑则跳过）═══
+          echo
           echo "=== 一键启动 DSH（调用 ~/dsh-cloudshell-start.sh）==="
           set +e
-          # 注意: ssh --command 是非交互 shell，不加载 ~/.bashrc，PATH 里没有 node。
-          # 脚本自身已会定位 node；这里再显式补一次，双保险。
           gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-            --command='export PATH=/usr/local/nvm/versions/node/v26.13.0/bin:$PATH; bash $HOME/dsh-cloudshell-start.sh' \
+            --command="$REMOTE_ENV bash \$HOME/dsh-cloudshell-start.sh" \
             > /tmp/start-dsh.log 2>&1
-          rc=${PIPESTATUS[0]:-$?}
+          rc=$?
           set -e
-          tail -30 /tmp/start-dsh.log 2>/dev/null || true
+          tail -25 /tmp/start-dsh.log 2>/dev/null || true
           echo "start_dsh_rc=$rc"
           if [ "$rc" -ne 0 ]; then
             echo "::error::dsh-cloudshell-start.sh 失败 rc=$rc"
             exit "$rc"
           fi
-          # 二次确认：远端 3080 必须应答
+
+          # ═══ 步骤 C: 二次确认 3080 真实应答 ═══
           chk=$(gcloud cloud-shell ssh --quiet $PROJECT_ARG \
             --command='curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:3080/' 2>/dev/null | tr -d '\r' | tail -1)
           echo "remote_3080=$chk"
@@ -181,17 +207,12 @@ jobs:
             exit 1
           fi
 
-          echo
-          echo "=== 拉起保活守护 (${HOURS}h) ==="
-          set +e
-          gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-            --command="bash \$HOME/keepalive/ka-start.sh --hours $HOURS --interval 45" > /tmp/ka-start.log 2>&1
-          krc=$?
-          set -e
-          tail -10 /tmp/ka-start.log 2>/dev/null || true
-          echo "ka_start_rc=$krc"
-          if [ "$krc" -ne 0 ]; then
-            echo "::warning::保活守护启动返回 rc=$krc（DSH 已就绪，循环仍会继续）"
+          # ═══ 步骤 D: 确认 tmux worker 真的在跑（保活生效的前提）═══
+          w=$(gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+            --command='tmux has-session -t dsh-keep 2>/dev/null && echo YES || echo NO' 2>/dev/null | tr -d '\r' | tail -1)
+          echo "tmux_worker_alive=$w"
+          if [ "$w" != "YES" ]; then
+            echo "::warning::tmux worker 未就绪，保活可能失效（DSH 本身可用）"
           fi
 
       - name: Long-running keepalive loop
