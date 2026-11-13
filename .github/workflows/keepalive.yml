@@ -119,21 +119,29 @@ jobs:
           PROJECT_ARG=""
           [ -n "${GCP_PROJECT:-}" ] && PROJECT_ARG="--project=$GCP_PROJECT"
 
-          # 确保远端目录存在
           gcloud cloud-shell ssh --quiet $PROJECT_ARG --command='mkdir -p $HOME/keepalive' || true
 
-          # 把远端脚本推上去（每次都用仓库版本覆盖，保证一致）
-          # scripts/remote/*.sh → $HOME/keepalive/*.sh
-          # scripts/remote-up.sh → $HOME/keepalive/remote-up.sh
-          for f in scripts/remote/ka.sh scripts/remote/ka-start.sh \
-                   scripts/remote/ka-stop.sh scripts/remote/ka-status.sh \
-                   scripts/remote-up.sh; do
-            base=$(basename "$f")
-            echo "sync $f -> ~/keepalive/$base"
+          # 一键启动脚本：优先用仓库内副本，没有就用远端已有的
+          if [ -f start/dsh-cloudshell-start.sh ]; then
+            echo "sync dsh-cloudshell-start.sh"
             gcloud cloud-shell scp --quiet $PROJECT_ARG \
-              "localhost:$PWD/$f" "cloudshell:/tmp/dsh-$base"
+              "localhost:$PWD/start/dsh-cloudshell-start.sh" "cloudshell:/tmp/dsh-start-sync.sh"
             gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-              --command="install -m 755 /tmp/dsh-$base \$HOME/keepalive/$base"
+              --command='install -m 755 /tmp/dsh-start-sync.sh $HOME/dsh-cloudshell-start.sh'
+          else
+            echo "仓库内无 start/dsh-cloudshell-start.sh，使用远端已有版本"
+          fi
+
+          # 保活脚本
+          for f in scripts/remote/ka.sh scripts/remote/ka-start.sh \
+                   scripts/remote/ka-stop.sh scripts/remote/ka-status.sh; do
+            base=$(basename "$f")
+            if [ -f "$f" ]; then
+              gcloud cloud-shell scp --quiet $PROJECT_ARG \
+                "localhost:$PWD/$f" "cloudshell:/tmp/dsh-$base"
+              gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+                --command="install -m 755 /tmp/dsh-$base \$HOME/keepalive/$base"
+            fi
           done
           echo "remote scripts synced"
 
@@ -143,12 +151,45 @@ jobs:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           HOURS: ${{ github.event.inputs.hours || '5' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           PROJECT_ARG=""
           [ -n "${GCP_PROJECT:-}" ] && PROJECT_ARG="--project=$GCP_PROJECT"
-          echo "=== 一键启动 DSH + 代理 + 守护 (${HOURS}h) ==="
+
+          # 注意: 不能用 `cmd | tail -N`，pipe 会把退出码换成 tail 的（恒为 0），
+          # 导致 gcloud 失败时本步骤仍显示 success（已踩）。改为先落文件再取尾部 + 显式检查 rc。
+          echo "=== 一键启动 DSH（调用 ~/dsh-cloudshell-start.sh）==="
+          set +e
           gcloud cloud-shell ssh --quiet $PROJECT_ARG \
-            --command="bash \$HOME/keepalive/remote-up.sh --hours $HOURS" 2>&1 | tail -25
+            --command='bash $HOME/dsh-cloudshell-start.sh' > /tmp/start-dsh.log 2>&1
+          rc=${PIPESTATUS[0]:-$?}
+          set -e
+          tail -30 /tmp/start-dsh.log 2>/dev/null || true
+          echo "start_dsh_rc=$rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::dsh-cloudshell-start.sh 失败 rc=$rc"
+            exit "$rc"
+          fi
+          # 二次确认：远端 3080 必须应答
+          chk=$(gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+            --command='curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:3080/' 2>/dev/null | tr -d '\r' | tail -1)
+          echo "remote_3080=$chk"
+          if [ "$chk" = "000" ] || [ -z "$chk" ]; then
+            echo "::error::远端 3080 无应答，DSH 未启动"
+            exit 1
+          fi
+
+          echo
+          echo "=== 拉起保活守护 (${HOURS}h) ==="
+          set +e
+          gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+            --command="bash \$HOME/keepalive/ka-start.sh --hours $HOURS --interval 45" > /tmp/ka-start.log 2>&1
+          krc=$?
+          set -e
+          tail -10 /tmp/ka-start.log 2>/dev/null || true
+          echo "ka_start_rc=$krc"
+          if [ "$krc" -ne 0 ]; then
+            echo "::warning::保活守护启动返回 rc=$krc（DSH 已就绪，循环仍会继续）"
+          fi
 
       - name: Long-running keepalive loop
         env:

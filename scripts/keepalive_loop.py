@@ -199,8 +199,32 @@ def main():
     log(f"预计结束: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC + {HOURS}h")
     log("=" * 52)
 
-    # 预检：一次都拿不到 token 就直接失败退出。
-    # 否则凭证失效时 job 会白占 5 小时 GitHub 额度。
+    # 预检 A：零成本检查（不调 gcloud，避免无凭证时 ssh 卡 60s+）
+    cred = os.path.expanduser("~/.gcp_cred.json")
+    cred_ok = False
+    if os.path.exists(cred):
+        try:
+            blob = json.load(open(cred))
+            if blob.get("refresh_token") or blob.get("private_key"):
+                cred_ok = True
+        except Exception as e:
+            log(f"凭证文件解析失败: {e}")
+    if not cred_ok:
+        # 也允许 CI 环境已有 ACTIVE 账号的情况
+        rc, out, _ = sh(["gcloud", "auth", "list", "--format=json"], timeout=30)
+        if rc == 0 and out:
+            try:
+                accounts = json.loads(out)
+                cred_ok = any(a.get("status") == "ACTIVE" for a in accounts
+                              if isinstance(a, dict))
+            except Exception:
+                pass
+    if not cred_ok:
+        log("预检失败: 无可用凭证（既无 ~/.gcp_cred.json 也没有 ACTIVE 账号），立即退出")
+        notify("❌ <b>Cloud Shell 保活启动失败</b>\n无可用凭证")
+        return 1
+
+    # 预检 B：真正取一次 token
     log("预检: 取 access token ...")
     if not get_token():
         log("预检失败: 完全取不到 token（凭证无效或已撤销），立即退出，不占额度")
