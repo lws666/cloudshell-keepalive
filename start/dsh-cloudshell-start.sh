@@ -91,6 +91,20 @@ is_listening() {
   (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
 }
 
+# --- cloudflared 存活检测（不能用 pgrep -f）---
+# 为什么: `pgrep -f "cloudflared tunnel ..."` 会匹配到执行该命令的 shell 自身
+#   （shell 的 cmdline 里含有这段字符串），结果永远为真。
+#   后果: cloudflared 挂掉后脚本仍判定"已在运行"，永不重启 → 访问隧道 1033 且无法自愈。
+# 做法: 遍历 /proc/<pid>/comm，精确比对进程名（comm 只有可执行文件名，不含参数）。
+cloudflared_running() {
+  local d
+  for d in /proc/[0-9]*; do
+    [ -r "$d/comm" ] || continue
+    [ "$(cat "$d/comm" 2>/dev/null)" = "cloudflared" ] && return 0
+  done
+  return 1
+}
+
 # --- HTTP 层回验: 端口通 != 服务活 ---
 # DSH 插件激活失败时会"先监听端口、约 2s 后才退出"(锁等待上限 2s),
 # 单次端口探测会把这种将死进程误判成已就绪, 于是照常启动代理 -> 浏览器永久 502。
@@ -285,7 +299,7 @@ TUNNEL_TOKEN_FILE="$HOME_DIR/.cloudflared/tunnel-token"
 TUNNEL_LOG="$CACHE_DIR/tunnel-named.log"
 if [ ! -s "$TUNNEL_TOKEN_FILE" ] || [ "$(wc -c < "$TUNNEL_TOKEN_FILE" 2>/dev/null || echo 0)" -lt 20 ]; then
   echo "[tunnel] 未配置 $TUNNEL_TOKEN_FILE, 跳过命名隧道 (固定域名不可用)"
-elif pgrep -f "cloudflared tunnel --no-autoupdate run --token-file" >/dev/null; then
+elif cloudflared_running; then
   echo "[tunnel] 命名隧道已在运行, 跳过启动"
 elif [ ! -x "$LOCAL_BIN/cloudflared" ]; then
   echo "[tunnel] 警告: 未找到 $LOCAL_BIN/cloudflared, 跳过"

@@ -24,6 +24,39 @@ const LOGIN_PATH = '/login';
 const DSH_LOG = `${process.env.HOME ?? ''}/.cache/dsh/dsh.log`;
 
 /**
+ * ── Cloudflare 302 跳板（方案：CF 只做跳转，流量走 Preview）──
+ *
+ * 动机：Cloudflare 免费隧道对 SSE/WebSocket 长连接有边缘空闲切断（表现为 1033），
+ *       加心跳只能缓解不能根除；而 Cloud Shell Preview 走 Google 自己的链路，
+ *       长连接没有这个问题，速度也更快。
+ *       但 Preview 域名里的区域段会随 VM 迁移变化（us-east1 -> us-central1），书签会失效。
+ *
+ * 做法：书签用固定域名 dsh.<domain>（Cloudflare），它只回一个 302 跳到当前 Preview。
+ *       浏览器随后直连 Preview，实际流量完全不过 Cloudflare，
+ *       因此那条被切断的长连接也不存在了 —— 1033 消失。
+ *
+ * 判据：本代理只监听 127.0.0.1:3081，所以凡是从公网域名进来的请求，
+ *       Host 一定不是 127.0.0.1:3081。用这个区分「外部跳板入口」和「内网直连」。
+ */
+const JUMP_ENABLED = process.env.PROXY_JUMP !== '0';
+const PREVIEW_HOST = process.env.WEB_HOST ?? '';           // 形如 cs-xxx.cs-us-central1-pits.cloudshell.dev
+const PREVIEW_PORT = process.env.PREVIEW_PORT ?? '3081';
+// 命中跳板时排除的路径：跳板本身要能被探测存活
+const JUMP_EXCLUDE = new Set(['/__jump_health']);
+
+function previewBase() {
+  if (!PREVIEW_HOST) return '';
+  return `https://${PREVIEW_PORT}-${PREVIEW_HOST}`;
+}
+
+/** 是否是经公网域名（Cloudflare/Tailscale 等）进来的请求 */
+function isExternalEntry(hostHeader) {
+  if (!hostHeader) return false;
+  const h = String(hostHeader).toLowerCase();
+  return !(h === `127.0.0.1:${LISTEN_PORT}` || h === '127.0.0.1' || h === `localhost:${LISTEN_PORT}`);
+}
+
+/**
  * 让浏览器端把本页当成 loopback 主机页.
  *
  * 客户端在 dsh-client-connection/lib/client.js 里自己算:
@@ -81,6 +114,37 @@ function rewriteHeaders(headers) {
 
 // --- 普通 HTTP 请求 (含 /api/* POST/GET) ---
 const server = http.createServer((req, res) => {
+  // ═══ 第一优先：公网域名进来的一律 302 到 Preview ═══
+  // 放在最前面，确保 /login、/api/*、SSE 等都先被跳走，
+  // 浏览器随后直连 Preview，长连接不再经过 Cloudflare。
+  if (JUMP_ENABLED) {
+    const pathOnly = (req.url ?? '/').split('?')[0];
+    if (pathOnly === '/__jump_health') {
+      const base = previewBase();
+      res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, jump: !!base, target: base || null }) + '\n');
+      return;
+    }
+    if (!JUMP_EXCLUDE.has(pathOnly) && isExternalEntry(req.headers.host)) {
+      const base = previewBase();
+      if (base) {
+        // 保留原始路径与查询串（含 token），跳到 Preview 的同路径
+        const suffix = req.url ?? '/';
+        res.writeHead(302, {
+          'cache-control': 'no-store',
+          location: base + suffix,
+          'referrer-policy': 'no-referrer',
+        });
+        res.end();
+        return;
+      }
+      // 没有 WEB_HOST 时无法跳转，给出明确提示而不是空 500
+      res.writeHead(503, { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8' });
+      res.end('rewrite-proxy: 未配置 WEB_HOST，无法生成 Preview 跳转地址\n');
+      return;
+    }
+  }
+
   // 无查询串的登录入口: 终端点击 https://<域名>/login 即可完成认证
   if (req.method === 'GET' && req.url?.split('?')[0] === LOGIN_PATH) {
     const token = currentToken();
@@ -211,4 +275,10 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.log(
     `rewrite-proxy: listening ${LISTEN_HOST}:${LISTEN_PORT} -> ${TARGET_HOST}:${TARGET_PORT}`,
   );
+  if (JUMP_ENABLED) {
+    const b = previewBase();
+    console.log(b ? `rewrite-proxy: 公网入口 302 跳板 -> ${b}` : 'rewrite-proxy: 跳板已启用但无 WEB_HOST');
+  } else {
+    console.log('rewrite-proxy: 跳板已禁用 (PROXY_JUMP=0)');
+  }
 });

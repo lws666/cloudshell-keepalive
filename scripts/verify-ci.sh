@@ -68,6 +68,9 @@ if [[ -f proxy/rewrite-proxy.mjs ]]; then
     bad "心跳间隔 ${ping_ms:-缺失}ms 过大"
   fi
   grep -q "': ping" proxy/rewrite-proxy.mjs && ok "注入 SSE 注释行" || bad "缺 ping 注入"
+  # 302 跳板：CF 只跳转，流量走 Preview，规避长连接切断
+  grep -q 'isExternalEntry' proxy/rewrite-proxy.mjs && ok "含 302 跳板逻辑" || bad "缺跳板"
+  grep -q 'PREVIEW_HOST' proxy/rewrite-proxy.mjs && ok "读 WEB_HOST 生成 Preview 地址" || bad "缺 Preview 地址生成"
 else
   bad "缺 proxy/rewrite-proxy.mjs"
 fi
