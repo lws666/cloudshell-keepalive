@@ -132,18 +132,33 @@ jobs:
             echo "仓库内无 start/dsh-cloudshell-start.sh，使用远端已有版本"
           fi
 
-          # 保活脚本
+          # 保活脚本 → ~/keepalive/
           for f in scripts/remote/ka.sh scripts/remote/ka-start.sh \
                    scripts/remote/ka-stop.sh scripts/remote/ka-status.sh \
                    scripts/remote/ka-tmux.sh; do
             base=$(basename "$f")
             if [ -f "$f" ]; then
+              echo "sync $f -> ~/keepalive/$base"
               gcloud cloud-shell scp --quiet $PROJECT_ARG \
                 "localhost:$PWD/$f" "cloudshell:/tmp/dsh-$base"
               gcloud cloud-shell ssh --quiet $PROJECT_ARG \
                 --command="install -m 755 /tmp/dsh-$base \$HOME/keepalive/$base"
             fi
           done
+
+          # 代理 → ~/.local/bin/rewrite-proxy.mjs
+          # 关键：不同步这个文件的话，新环境里 3081 起不来，
+          #       Preview 地址和 302 跳板全部失效（DSH 本身却在跑，容易误判"都正常"）。
+          if [ -f proxy/rewrite-proxy.mjs ]; then
+            echo "sync proxy/rewrite-proxy.mjs -> ~/.local/bin/"
+            gcloud cloud-shell ssh --quiet $PROJECT_ARG --command='mkdir -p $HOME/.local/bin' || true
+            gcloud cloud-shell scp --quiet $PROJECT_ARG \
+              "localhost:$PWD/proxy/rewrite-proxy.mjs" "cloudshell:/tmp/dsh-rewrite-proxy.mjs"
+            gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+              --command='install -m 755 /tmp/dsh-rewrite-proxy.mjs $HOME/.local/bin/rewrite-proxy.mjs && echo PROXY_SYNCED'
+          else
+            echo "仓库内无 proxy/rewrite-proxy.mjs，使用远端已有版本"
+          fi
           echo "remote scripts synced"
 
       - name: Start DSH on remote
@@ -206,6 +221,16 @@ jobs:
           echo "remote_3080=$chk"
           if [ "$chk" = "000" ] || [ -z "$chk" ]; then
             echo "::error::远端 3080 无应答，DSH 未启动"
+            exit 1
+          fi
+
+          # ═══ 步骤 C2: 确认代理 3081 活着（Preview 与跳板的前提）═══
+          pchk=$(gcloud cloud-shell ssh --quiet $PROJECT_ARG \
+            --command='curl -s -o /dev/null -w "PCODE_%{http_code}\n" --max-time 5 http://127.0.0.1:3081/' 2>/dev/null \
+            | tr -d '\r' | grep -oE 'PCODE_[0-9]{3}' | head -1 | cut -d_ -f2)
+          echo "remote_3081=$pchk"
+          if [ "$pchk" = "000" ] || [ -z "$pchk" ]; then
+            echo "::error::远端 3081 无应答，代理未启动（Preview/跳板会失效）"
             exit 1
           fi
 

@@ -75,6 +75,20 @@ else
   bad "缺 proxy/rewrite-proxy.mjs"
 fi
 
+echo "═══ 2e. ka-tmux worker 完整性 ═══"
+if [[ -f scripts/remote/ka-tmux.sh ]]; then
+  ok "ka-tmux.sh 存在"
+  # 关键：所有被 worker 调用的函数都必须 declare -f 序列化进去
+  for fn in http_code proc_alive pid_on_port proxy_healthy tunnel_healthy restart_proxy restart_tunnel worker; do
+    grep -q "declare -f $fn" scripts/remote/ka-tmux.sh && ok "序列化 $fn" || bad "缺 declare -f $fn（worker 里会缺定义）"
+  done
+  iv=$(grep -oE 'INTERVAL_MIN:-[0-9]+' scripts/remote/ka-tmux.sh | grep -oE '[0-9]+$' | head -1)
+  if [[ -n "$iv" ]] && (( iv <= 10 )); then ok "轮询间隔 ${iv}min（短，故障窗口小）"; else bad "间隔 ${iv:-缺失}min 过大"; fi
+  grep -q 'tunnel_healthy' scripts/remote/ka-tmux.sh && ok "含隧道健康检测（不只看进程）" || bad "缺隧道健康检测"
+else
+  bad "缺 scripts/remote/ka-tmux.sh"
+fi
+
 echo "═══ 3. Python 脚本 ═══"
 python3 -m py_compile scripts/keepalive_loop.py && ok "语法通过" || bad "语法错误"
 grep -q 'ENV_NAME}:start' scripts/keepalive_loop.py && ok "含 :start API" || bad "缺 :start"

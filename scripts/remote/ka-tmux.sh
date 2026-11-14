@@ -34,11 +34,78 @@ SESSION="dsh-keep"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$HERE/tmux-keep.log"
 START_SH="$HOME/dsh-cloudshell-start.sh"
-INTERVAL_MIN="${INTERVAL_MIN:-20}"
+INTERVAL_MIN="${INTERVAL_MIN:-5}"
 
 http_code() {
   local o; o=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$1" 2>/dev/null)
   printf '%s' "${o:-000}"
+}
+
+# 按进程名精确检测（不能用 pgrep -f：会匹配到执行命令的 shell 自身）
+proc_alive() {
+  local name=$1 d
+  for d in /proc/[0-9]*; do
+    [ -r "$d/comm" ] || continue
+    [ "$(cat "$d/comm" 2>/dev/null)" = "$name" ] && return 0
+  done
+  return 1
+}
+
+# 按监听端口反查 pid
+pid_on_port() {
+  ss -ltnp 2>/dev/null | grep -E "127\.0\.0\.1:$1\b" \
+    | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+}
+
+# 代理健康 = 进程在 + 3081 有 HTTP 应答
+# 只查进程不够：曾实测 kill(SIGTERM) 后进程滞留为 S<l+ 但功能已死，返回 530/无响应
+# 注：不要用 proc_alive node —— 实测 node 进程的 comm 是 "node-MainThread"，
+#     精确比对会永远失败。改用「端口有进程 + HTTP 有应答」双判据，更直接。
+proxy_healthy() {
+  [ -n "$(pid_on_port 3081)" ] || return 1
+  local c; c=$(http_code "http://127.0.0.1:3081/")
+  [ "$c" != "000" ]
+}
+
+# 隧道健康 = cloudflared 进程在 + 域名能应答
+# 只查进程不够：进程假死时隧道返回 530（实测）
+tunnel_healthy() {
+  proc_alive cloudflared || return 1
+  [ -s "$HOME/.cloudflared/tunnel-token" ] || return 0  # 没配隧道就不算故障
+  local c; c=$(http_code "https://dsh.lwsnb.eu.cc/login")
+  [ "$c" != "000" ] && [ "$c" != "530" ]
+}
+
+# 重启代理（detached，不随 worker 死）
+restart_proxy() {
+  local p; p=$(pid_on_port 3081)
+  [ -n "$p" ] && kill -9 "$p" 2>/dev/null && sleep 1
+  # 清掉可能滞留的代理进程（按 cmdline 匹配，comm 不可靠）
+  local d cl
+  for d in /proc/[0-9]*; do
+    [ -r "$d/cmdline" ] || continue
+    cl=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    case "$cl" in *rewrite-proxy.mjs*) kill -9 "${d#/proc/}" 2>/dev/null ;; esac
+  done
+  sleep 1
+  setsid nohup node "$HOME/.local/bin/rewrite-proxy.mjs" \
+    >> "$HOME/.cache/dsh/proxy.log" 2>&1 < /dev/null &
+  sleep 3
+}
+
+# 重启隧道
+restart_tunnel() {
+  local d
+  for d in /proc/[0-9]*; do
+    [ -r "$d/comm" ] || continue
+    [ "$(cat "$d/comm" 2>/dev/null)" = "cloudflared" ] && kill -9 "${d#/proc/}" 2>/dev/null
+  done
+  sleep 2
+  [ -x "$HOME/.local/bin/cloudflared" ] || return 1
+  setsid nohup "$HOME/.local/bin/cloudflared" tunnel --no-autoupdate run \
+    --token-file "$HOME/.cloudflared/tunnel-token" \
+    >> "$HOME/.cache/dsh/tunnel-named.log" 2>&1 < /dev/null &
+  sleep 8
 }
 
 # tmux 里的工作循环
@@ -55,37 +122,37 @@ worker() {
     bash "$START_SH" >> "$LOG" 2>&1
     after=$(http_code "http://127.0.0.1:3080/")
 
-    # 顺带迁移仍绑在用户终端上的代理（只在无活跃连接时做，避免 502）
-    local psid_mine psid_proxy conns
-    psid_mine=$(ps -o sid= -p $$ | tr -d ' ')
-    psid_proxy=$(ps -eo pid,sid,cmd | awk '/rewrite-proxy\.mjs/ && !/awk/{print $2; exit}')
-    conns=$(ss -tn state established 2>/dev/null | grep -c ":3081" || true)
-    if [[ -n "$psid_proxy" && "$psid_proxy" != "$psid_mine" ]]; then
-      if (( ${conns:-0} == 0 )); then
-        printf '%s 代理 SID=%s ≠ tmux=%s 且无连接，迁移\n' \
-          "$(date '+%F %T')" "$psid_proxy" "$psid_mine" >> "$LOG"
-        local ppid
-        ppid=$(ss -ltnp 2>/dev/null | grep -E "127\.0\.0\.1:3081\b" \
-               | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-        [[ -n "$ppid" ]] && kill "$ppid" 2>/dev/null && sleep 2
-        # 用 setsid 让代理自带会话：worker 重启/退出都不影响它
-        # （setsid 只保证不随 worker 死，仍独立于用户终端）
-        setsid nohup node "$HOME/.local/bin/rewrite-proxy.mjs" \
-          >> "$HOME/.cache/dsh/proxy.log" 2>&1 < /dev/null &
-        sleep 3
-        printf '%s 代理已迁移 SID=%s\n' \
-          "$(date '+%F %T')" \
+    # ── 代理健康检查 + 自愈 ──
+    # 不只看进程，还要 3081 能应答；假死（进程在但端口无响应）也会重启
+    if ! proxy_healthy; then
+      printf '%s [自愈] 代理不健康 → 重启\n' "$(date '+%F %T')" >> "$LOG"
+      restart_proxy
+      if proxy_healthy; then
+        printf '%s [自愈] 代理已恢复 code=%s sid=%s\n' \
+          "$(date '+%F %T')" "$(http_code http://127.0.0.1:3081/)" \
           "$(ps -eo pid,sid,cmd | awk '/rewrite-proxy\.mjs/ && !/awk/{print $2; exit}')" >> "$LOG"
       else
-        printf '%s 代理 SID=%s 仍绑用户终端，但有 %s 个连接，跳过迁移\n' \
-          "$(date '+%F %T')" "$psid_proxy" "$conns" >> "$LOG"
+        printf '%s [自愈] 代理重启失败\n' "$(date '+%F %T')" >> "$LOG"
       fi
     fi
 
-    printf '%s 前=%s 后=%s dsh_sid=%s proxy_sid=%s\n' \
+    # ── 隧道健康检查 + 自愈 ──
+    # 进程假死时隧道会返回 530，只看进程判断不出来
+    if ! tunnel_healthy; then
+      printf '%s [自愈] 隧道不健康 → 重启\n' "$(date '+%F %T')" >> "$LOG"
+      restart_tunnel
+      if tunnel_healthy; then
+        printf '%s [自愈] 隧道已恢复\n' "$(date '+%F %T')" >> "$LOG"
+      else
+        printf '%s [自愈] 隧道重启失败（继续观察）\n' "$(date '+%F %T')" >> "$LOG"
+      fi
+    fi
+
+    printf '%s 前=%s 后=%s 代理=%s 隧道=%s dsh_sid=%s\n' \
       "$(date '+%F %T')" "$before" "$after" \
-      "$(ps -eo pid,sid,cmd | awk '/bin\.js web/ && !/awk/{print $2; exit}')" \
-      "$(ps -eo pid,sid,cmd | awk '/rewrite-proxy\.mjs/ && !/awk/{print $2; exit}')" >> "$LOG"
+      "$(http_code http://127.0.0.1:3081/)" \
+      "$(http_code https://dsh.lwsnb.eu.cc/login)" \
+      "$(ps -eo pid,sid,cmd | awk '/bin\.js web/ && !/awk/{print $2; exit}')" >> "$LOG"
 
     # 睡眠（分段，便于 stop 快速生效）
     local slept=0
@@ -111,7 +178,16 @@ case "${1:-start}" in
     {
       echo '#!/usr/bin/env bash'
       echo 'set -uo pipefail'
+      # 必须把所有被 worker 调用的函数都序列化进去，
+      # 否则 worker 脚本里缺定义 → 检测恒失败 → 每轮误报「自愈」。
+      # （踩过：新增的 pid_on_port/proxy_healthy/tunnel_healthy 漏在这里）
       declare -f http_code
+      declare -f proc_alive
+      declare -f pid_on_port
+      declare -f proxy_healthy
+      declare -f tunnel_healthy
+      declare -f restart_proxy
+      declare -f restart_tunnel
       declare -f worker
       echo "LOG='$LOG'"
       echo "START_SH='$START_SH'"
