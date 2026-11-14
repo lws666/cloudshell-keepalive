@@ -57,6 +57,21 @@ else
   bad "缺 start/dsh-cloudshell-start.sh"
 fi
 
+echo "═══ 2d. SSE 心跳（修复 Cloudflare 1033）═══"
+if [[ -f proxy/rewrite-proxy.mjs ]]; then
+  ok "proxy/rewrite-proxy.mjs 存在"
+  grep -q 'text/event-stream' proxy/rewrite-proxy.mjs && ok "识别 SSE 响应" || bad "缺 SSE 分支"
+  ping_ms=$(grep -oE 'PING_MS = [0-9]+' proxy/rewrite-proxy.mjs | grep -oE '[0-9]+' | head -1)
+  if [[ -n "$ping_ms" ]] && (( ping_ms <= 15000 )); then
+    ok "心跳间隔 ${ping_ms}ms（≤15s，抗 CF 空闲切断）"
+  else
+    bad "心跳间隔 ${ping_ms:-缺失}ms 过大"
+  fi
+  grep -q "': ping" proxy/rewrite-proxy.mjs && ok "注入 SSE 注释行" || bad "缺 ping 注入"
+else
+  bad "缺 proxy/rewrite-proxy.mjs"
+fi
+
 echo "═══ 3. Python 脚本 ═══"
 python3 -m py_compile scripts/keepalive_loop.py && ok "语法通过" || bad "语法错误"
 grep -q 'ENV_NAME}:start' scripts/keepalive_loop.py && ok "含 :start API" || bad "缺 :start"
