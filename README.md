@@ -103,19 +103,19 @@ gcloud services enable cloudshell.googleapis.com --project=<你的项目ID>
 ### 3. 配置 Secrets
 
 ```bash
-gh secret set GCP_CRED_JSON --repo lws666/cloudshell-keepalive \
+gh secret set GCP_CRED_JSON --repo <你的账号>/cloudshell-keepalive \
   < ~/.config/gcloud/application_default_credentials.json
-gh secret set GCP_PROJECT --repo lws666/cloudshell-keepalive --body "你的项目ID"
+gh secret set GCP_PROJECT --repo <你的账号>/cloudshell-keepalive --body "你的项目ID"
 
 # 可选：Telegram 通知
-gh secret set TG_BOT_TOKEN --repo lws666/cloudshell-keepalive --body "123:AAH..."
-gh secret set TG_CHAT_ID  --repo lws666/cloudshell-keepalive --body "123456789"
+gh secret set TG_BOT_TOKEN --repo <你的账号>/cloudshell-keepalive --body "123:AAH..."
+gh secret set TG_CHAT_ID  --repo <你的账号>/cloudshell-keepalive --body "123456789"
 ```
 
 ### 4. 已部署仓库
 
 ```
-https://github.com/lws666/cloudshell-keepalive   (private)
+https://github.com/<你的账号>/cloudshell-keepalive
 ```
 
 ## 目录结构

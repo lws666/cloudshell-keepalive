@@ -76,7 +76,16 @@ DSH_PATH_FILE="$CACHE_DIR/path"
 AR_EGRESS_LOG="$CACHE_DIR/ar-egress.log"
 AR_RELAY_TARGET="https://ar-relay.13318678430.workers.dev"
 # 命名隧道的固定域名 (Cloudflare 面板的 Public Hostname); 仅用于打印认证 URL, 不改隧道配置
-TUNNEL_HOSTNAME="dsh.lwsnb.eu.cc"
+# 命名隧道的固定域名：解析优先级（仓库公开，故不硬编码真实域名）
+#   1. $TUNNEL_HOSTNAME 环境变量
+#   2. ~/.cloudflared/hostname 文件（每台机器自己写一行真实域名）
+#   3. 占位示例
+# 这样仓库可以公开，而每台部署机仍用自己的域名。
+TUNNEL_HOSTNAME="${TUNNEL_HOSTNAME:-}"
+if [ -z "$TUNNEL_HOSTNAME" ] && [ -s "$HOME/.cloudflared/hostname" ]; then
+  TUNNEL_HOSTNAME="$(head -1 "$HOME/.cloudflared/hostname" | tr -d '[:space:]')"
+fi
+TUNNEL_HOSTNAME="${TUNNEL_HOSTNAME:-dsh.example.com}"
 # 固定 DSH 版本 (npx 首次安装时生效)
 # 2026-09-27: 0.1.0-rc.6 -> 0.1.2-rc.1，因 dsh-codearts-auth 需 dsh-llm 导出
 #   ToolCallId（0.1.2-rc.1 起才有）；rc.6 下插件加载失败会导致 DSH 整个起不来。

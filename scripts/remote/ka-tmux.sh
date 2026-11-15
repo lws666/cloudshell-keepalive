@@ -72,7 +72,10 @@ proxy_healthy() {
 tunnel_healthy() {
   proc_alive cloudflared || return 1
   [ -s "$HOME/.cloudflared/tunnel-token" ] || return 0  # 没配隧道就不算故障
-  local c; c=$(http_code "https://dsh.lwsnb.eu.cc/login")
+  local c; local th="${TUNNEL_HOST:-}"
+  [ -z "$th" ] && [ -s "$HOME/.cloudflared/hostname" ] && th=$(head -1 "$HOME/.cloudflared/hostname" | tr -d '[:space:]')
+  th="${th:-dsh.example.com}"
+  c=$(http_code "https://$th/login")
   [ "$c" != "000" ] && [ "$c" != "530" ]
 }
 
@@ -151,7 +154,7 @@ worker() {
     printf '%s 前=%s 后=%s 代理=%s 隧道=%s dsh_sid=%s\n' \
       "$(date '+%F %T')" "$before" "$after" \
       "$(http_code http://127.0.0.1:3081/)" \
-      "$(http_code https://dsh.lwsnb.eu.cc/login)" \
+      "$(http_code "https://$( [ -s "$HOME/.cloudflared/hostname" ] && head -1 "$HOME/.cloudflared/hostname" | tr -d "[:space:]" || echo dsh.example.com )/login")" \
       "$(ps -eo pid,sid,cmd | awk '/bin\.js web/ && !/awk/{print $2; exit}')" >> "$LOG"
 
     # 睡眠（分段，便于 stop 快速生效）

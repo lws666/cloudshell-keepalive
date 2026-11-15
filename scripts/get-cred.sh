@@ -16,7 +16,7 @@
 set -uo pipefail
 OUT="$HOME/.gcp_cred_ci.json"
 CFG="$HOME/.config/gcloud-ci"
-REPO="lws666/cloudshell-keepalive"
+REPO="${REPO:-你的账号/cloudshell-keepalive}"
 
 case "${1:-}" in
   --show)   [[ -f "$OUT" ]] && cat "$OUT" || echo "还没生成"; exit 0 ;;
